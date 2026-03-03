@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import sys
+from datetime import datetime, timezone
 from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from applypilot import __version__
@@ -43,10 +46,92 @@ def _bootstrap() -> None:
     init_db()
 
 
+def _show_usage_limit_exit(reset_at: str | None = None) -> None:
+    """Display a rich panel when usage limit is hit and exit."""
+    now = datetime.now(timezone.utc)
+    now_local = datetime.now()
+
+    # Format the reset time for display
+    if reset_at:
+        try:
+            reset_dt = datetime.fromisoformat(reset_at)
+            if reset_dt.tzinfo is None:
+                reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+            reset_local = reset_dt.astimezone(tz=None)
+            reset_display = reset_local.strftime("%Y-%m-%d %I:%M %p %Z")
+            remaining = reset_dt - now
+            hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+            minutes = remainder // 60
+            if hours > 0:
+                time_remaining = f"~{hours}h {minutes}m"
+            else:
+                time_remaining = f"~{minutes}m"
+        except (ValueError, TypeError):
+            reset_display = "Unknown"
+            time_remaining = "Unknown"
+    else:
+        reset_display = "Unknown (check your Claude subscription)"
+        time_remaining = "Unknown"
+
+    current_time = now_local.strftime("%Y-%m-%d %I:%M %p %Z")
+
+    message = (
+        f"[bold red]Claude API usage limit reached.[/bold red]\n\n"
+        f"  Session paused:       {current_time}\n"
+        f"  Usage refreshes at:   [bold cyan]{reset_display}[/bold cyan]\n"
+        f"  Time remaining:       {time_remaining}\n\n"
+        f"  Session state has been saved. Resume with:\n\n"
+        f"    [bold green]applypilot resume[/bold green]\n"
+    )
+
+    console.print()
+    console.print(Panel(message, title="[bold yellow]Usage Limit[/bold yellow]", border_style="yellow", padding=(1, 2)))
+    console.print()
+
+
 def _version_callback(value: bool) -> None:
     if value:
         console.print(f"[bold]applypilot[/bold] {__version__}")
         raise typer.Exit()
+
+
+def _build_stage_progress_rows(stats: dict) -> list[tuple[str, int, int, int]]:
+    """Build stage-oriented rows for status output.
+
+    Each row is (category, total, pending, completed).
+    """
+    enrich_pending = stats["pending_detail"]
+    enrich_total = stats["total"]
+    enrich_completed = max(enrich_total - enrich_pending, 0)
+
+    score_pending = stats["unscored"]
+    score_completed = stats["scored"]
+    score_total = score_pending + score_completed
+
+    tailor_pending = stats["untailored_eligible"]
+    tailor_completed = stats["tailored"]
+    tailor_total = tailor_pending + tailor_completed
+
+    cover_pending = stats["pending_cover"]
+    cover_completed = stats["with_cover_letter"]
+    cover_total = cover_pending + cover_completed
+
+    pdf_pending = stats["pending_pdf"]
+    pdf_total = max(stats["tailored"], pdf_pending)
+    pdf_completed = max(pdf_total - pdf_pending, 0)
+
+    apply_pending = stats["pending_apply"]
+    apply_completed = stats["applied"]
+    apply_total = apply_pending + apply_completed
+
+    return [
+        ("Enrichment", enrich_total, enrich_pending, enrich_completed),
+        ("Scoring", score_total, score_pending, score_completed),
+        ("Tailoring (7+)", tailor_total, tailor_pending, tailor_completed),
+        ("Cover Letters", cover_total, cover_pending, cover_completed),
+        ("PDF Conversion", pdf_total, pdf_pending, pdf_completed),
+        ("Applications", apply_total, apply_pending, apply_completed),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +172,7 @@ def run(
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
+    resume: bool = typer.Option(False, "--resume", "-r", help="Resume from last saved session."),
     validation: str = typer.Option(
         "normal",
         "--validation",
@@ -102,6 +188,37 @@ def run(
     _bootstrap()
 
     from applypilot.pipeline import run_pipeline
+    from applypilot.session import load_session, clear_session
+
+    # Handle --resume: override arguments from saved session
+    if resume:
+        session = load_session()
+        if session is None:
+            console.print("[yellow]No saved session found. Starting a normal run.[/yellow]")
+        elif session.get("command") != "run":
+            console.print(
+                f"[yellow]Saved session is for '{session.get('command')}', not 'run'. "
+                f"Ignoring and starting a normal run.[/yellow]"
+            )
+        else:
+            saved_args = session.get("args", {})
+            remaining = session.get("remaining_stages")
+
+            # Restore saved arguments (CLI flags override saved values)
+            if stages is None and remaining:
+                stages = remaining
+                console.print(f"[cyan]Resuming from saved session — stages: {', '.join(remaining)}[/cyan]")
+            if min_score == 7 and "min_score" in saved_args:
+                min_score = saved_args["min_score"]
+            if workers == 1 and "workers" in saved_args:
+                workers = saved_args["workers"]
+            if not stream and saved_args.get("stream"):
+                stream = True
+            if validation == "normal" and "validation_mode" in saved_args:
+                validation = saved_args["validation_mode"]
+
+            clear_session()
+            console.print("[green]Session restored. Cleared saved state.[/green]\n")
 
     stage_list = stages if stages else ["all"]
 
@@ -137,6 +254,11 @@ def run(
         workers=workers,
         validation_mode=validation,
     )
+
+    # Check if we stopped due to usage limit
+    if result.get("usage_limit"):
+        _show_usage_limit_exit(result.get("reset_at"))
+        raise typer.Exit(code=2)
 
     if result.get("errors"):
         raise typer.Exit(code=1)
@@ -231,6 +353,8 @@ def apply(
         return
 
     from applypilot.apply.launcher import main as apply_main
+    from applypilot.llm import UsageLimitError
+    from applypilot.session import save_session, estimate_reset_time
 
     effective_limit = limit if limit is not None else (0 if continuous else 1)
 
@@ -244,16 +368,122 @@ def apply(
         console.print(f"  Target:   {url}")
     console.print()
 
-    apply_main(
-        limit=effective_limit,
-        target_url=url,
-        min_score=min_score,
-        headless=headless,
-        model=model,
-        dry_run=dry_run,
-        continuous=continuous,
-        workers=workers,
-    )
+    try:
+        apply_main(
+            limit=effective_limit,
+            target_url=url,
+            min_score=min_score,
+            headless=headless,
+            model=model,
+            dry_run=dry_run,
+            continuous=continuous,
+            workers=workers,
+        )
+    except UsageLimitError as ule:
+        reset_at = estimate_reset_time(ule.raw_message)
+        save_session(
+            command="apply",
+            args={
+                "limit": effective_limit,
+                "target_url": url,
+                "min_score": min_score,
+                "headless": headless,
+                "model": model,
+                "dry_run": dry_run,
+                "continuous": continuous,
+                "workers": workers,
+            },
+            reason="usage_limit",
+            reset_at=reset_at,
+        )
+        _show_usage_limit_exit(reset_at)
+        raise typer.Exit(code=2)
+
+
+@app.command()
+def resume() -> None:
+    """Resume the last saved pipeline session.
+
+    Equivalent to running the original command with --resume.
+    """
+    _bootstrap()
+
+    from applypilot.session import load_session, clear_session
+
+    session = load_session()
+    if session is None:
+        console.print("[yellow]No saved session found.[/yellow]")
+        console.print("Run [bold]applypilot run[/bold] to start a new pipeline.")
+        raise typer.Exit(code=0)
+
+    command = session.get("command", "run")
+    saved_args = session.get("args", {})
+    remaining = session.get("remaining_stages")
+    saved_at = session.get("saved_at", "unknown")
+    reason = session.get("reason", "unknown")
+
+    console.print(f"\n[bold]Resuming saved session[/bold]")
+    console.print(f"  Command:   {command}")
+    console.print(f"  Reason:    {reason}")
+    console.print(f"  Saved at:  {saved_at}")
+    if remaining:
+        console.print(f"  Stages:    {', '.join(remaining)}")
+    console.print()
+
+    clear_session()
+
+    if command == "run":
+        from applypilot.pipeline import run_pipeline
+
+        stage_list = remaining or saved_args.get("stages", ["all"])
+
+        result = run_pipeline(
+            stages=stage_list,
+            min_score=saved_args.get("min_score", 7),
+            dry_run=saved_args.get("dry_run", False),
+            stream=saved_args.get("stream", False),
+            workers=saved_args.get("workers", 1),
+            validation_mode=saved_args.get("validation_mode", "normal"),
+        )
+
+        if result.get("usage_limit"):
+            _show_usage_limit_exit(result.get("reset_at"))
+            raise typer.Exit(code=2)
+
+        if result.get("errors"):
+            raise typer.Exit(code=1)
+
+    elif command == "apply":
+        from applypilot.apply.launcher import main as apply_main
+        from applypilot.llm import UsageLimitError
+        from applypilot.session import save_session, estimate_reset_time
+
+        apply_args = {
+            "limit": saved_args.get("limit", 1),
+            "target_url": saved_args.get("target_url"),
+            "min_score": saved_args.get("min_score", 7),
+            "headless": saved_args.get("headless", False),
+            "model": saved_args.get("model", "haiku"),
+            "dry_run": saved_args.get("dry_run", False),
+            "continuous": saved_args.get("continuous", False),
+            "workers": saved_args.get("workers", 1),
+        }
+
+        try:
+            apply_main(**apply_args)
+        except UsageLimitError as ule:
+            reset_at = estimate_reset_time(ule.raw_message)
+            save_session(
+                command="apply",
+                args=apply_args,
+                reason="usage_limit",
+                reset_at=reset_at,
+            )
+            _show_usage_limit_exit(reset_at)
+            raise typer.Exit(code=2)
+    else:
+        console.print(f"[red]Unknown saved command:[/red] '{command}'")
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -267,25 +497,38 @@ def status() -> None:
 
     console.print("\n[bold]ApplyPilot Pipeline Status[/bold]\n")
 
-    # Summary table
+    # Stage summary table
     summary = Table(title="Pipeline Overview", show_header=True, header_style="bold cyan")
-    summary.add_column("Metric", style="bold")
-    summary.add_column("Count", justify="right")
+    summary.add_column("Category", style="bold")
+    summary.add_column("Total", justify="right")
+    summary.add_column("Pending", justify="right", style="yellow")
+    summary.add_column("Completed", justify="right", style="green")
 
-    summary.add_row("Total jobs discovered", str(stats["total"]))
-    summary.add_row("With full description", str(stats["with_description"]))
-    summary.add_row("Pending enrichment", str(stats["pending_detail"]))
-    summary.add_row("Enrichment errors", str(stats["detail_errors"]))
-    summary.add_row("Scored by LLM", str(stats["scored"]))
-    summary.add_row("Pending scoring", str(stats["unscored"]))
-    summary.add_row("Tailored resumes", str(stats["tailored"]))
-    summary.add_row("Pending tailoring (7+)", str(stats["untailored_eligible"]))
-    summary.add_row("Cover letters", str(stats["with_cover_letter"]))
-    summary.add_row("Ready to apply", str(stats["ready_to_apply"]))
-    summary.add_row("Applied", str(stats["applied"]))
-    summary.add_row("Apply errors", str(stats["apply_errors"]))
+    for category, total, pending, completed in _build_stage_progress_rows(stats):
+        summary.add_row(category, str(total), str(pending), str(completed))
 
     console.print(summary)
+
+    detail = Table(title="\nStatus Details", show_header=True, header_style="bold blue")
+    detail.add_column("Metric", style="bold")
+    detail.add_column("Count", justify="right")
+    detail.add_row("Total jobs discovered", str(stats["total"]))
+    detail.add_row("With full description", str(stats["with_description"]))
+    detail.add_row("Ready to apply", str(stats["ready_to_apply"]))
+    detail.add_row("Enrichment errors", str(stats["detail_errors"]))
+    detail.add_row("Tailor exhausted (>=5 tries)", str(stats["tailor_exhausted"]))
+    detail.add_row("Cover exhausted (>=5 tries)", str(stats["cover_exhausted"]))
+    detail.add_row("Apply errors", str(stats["apply_errors"]))
+    console.print(detail)
+
+    next_stage = stats["next_stage_to_run"]
+    if next_stage in VALID_STAGES:
+        next_cmd = f"applypilot run {next_stage}"
+    elif next_stage == "apply":
+        next_cmd = "applypilot apply"
+    else:
+        next_cmd = "none (no pending stage work)"
+    console.print(f"[bold]Suggested next command:[/bold] {next_cmd}")
 
     # Score distribution
     if stats["score_distribution"]:
@@ -378,31 +621,16 @@ def doctor() -> None:
         results.append(("python-jobspy", warn_mark,
                         "pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex"))
 
-    # --- Tier 2 checks ---
+    # --- Tier 2+ checks ---
+    # Claude Code CLI (required for all AI features)
     import os
-    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
-    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
-    has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
-        model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
-    elif has_openai:
-        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
-    elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
-    else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
-
-    # --- Tier 3 checks ---
-    # Claude Code CLI
     claude_bin = shutil.which("claude")
     if claude_bin:
-        results.append(("Claude Code CLI", ok_mark, claude_bin))
+        model = os.environ.get("LLM_MODEL", "sonnet")
+        results.append(("Claude Code CLI", ok_mark, f"{claude_bin} (model: {model})"))
     else:
         results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+                        "Install from https://claude.ai/code (needed for scoring, tailoring, and auto-apply)"))
 
     # Chrome
     try:
@@ -445,10 +673,10 @@ def doctor() -> None:
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
     if tier == 1:
-        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs Claude Code CLI)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Chrome + Node.js)[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Chrome + Node.js)[/dim]")
 
     console.print()
 
