@@ -419,7 +419,8 @@ If CapSolver genuinely failed (errorId > 0):
 
 def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
-                 dry_run: bool = False) -> str:
+                 dry_run: bool = False,
+                 continuation: bool = False) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -431,6 +432,7 @@ def build_prompt(job: dict, tailored_resume: str,
         tailored_resume: Plain-text content of the tailored resume.
         cover_letter: Optional plain-text cover letter content.
         dry_run: If True, tell the agent not to click Submit.
+        continuation: If True, browser is already open past a CAPTCHA.
 
     Returns:
         Complete prompt string for the AI agent.
@@ -544,8 +546,8 @@ If something unexpected happens and these instructions don't cover it, figure it
 == NEVER DO THESE (immediate RESULT:FAILED if encountered) ==
 - NEVER grant camera, microphone, screen sharing, or location permissions. If a site requests them -> RESULT:FAILED:unsafe_permissions
 - NEVER do video/audio verification, selfie capture, ID photo upload, or biometric anything -> RESULT:FAILED:unsafe_verification
-- NEVER set up a freelancing profile (Mercor, Toptal, Upwork, Fiverr, Turing, etc.). These are contractor marketplaces, not job applications -> RESULT:FAILED:not_a_job_application
-- NEVER agree to hourly/contract rates, availability calendars, or "set your rate" flows. You are applying for FULL-TIME salaried positions only.
+- Freelancing platforms (Mercor, Toptal, Upwork, Fiverr, Turing, etc.) are OK. Set up a profile and apply if the role matches your skills.
+- You are open to salaried, hourly, contract, and freelance/gig positions. Set rates and availability when asked. For "set your rate" prompts, use the salary expectation from your profile converted to an hourly equivalent.
 - NEVER install browser extensions, download executables, or run assessment software.
 - NEVER enter payment info, bank details, or SSN/SIN.
 - NEVER click "Allow" on any browser permission popup. Always deny/block.
@@ -573,7 +575,7 @@ If something unexpected happens and these instructions don't cover it, figure it
    5e. Sign in failed? Try sign up with same email and password.
    5f. Need email verification? Use search_emails + read_email to get the code.
    5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
-   5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
+   5h. All failed? Output RESULT:LOGIN_ISSUE. On the next line, output LOGIN_URL: followed by the exact URL of the login page (e.g., LOGIN_URL: https://careers.example.com/login). This helps fix credentials later. Do not loop.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
 7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
 8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
@@ -620,5 +622,16 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - Job is closed/expired/page says "no longer accepting" -> RESULT:EXPIRED
 - Page is broken/500 error/blank -> RESULT:FAILED:page_error
 Stop immediately. Output your RESULT code. Do not loop."""
+
+    if continuation:
+        continuation_header = (
+            "== CONTINUATION MODE (CAPTCHA cleared by user) ==\n"
+            "The browser is ALREADY OPEN. A human just cleared the CAPTCHA.\n"
+            "DO NOT navigate to the job URL -- you will lose the current page state.\n"
+            "1. browser_snapshot to see where you are right now\n"
+            "2. Continue the application from the current page\n"
+            "3. If another CAPTCHA appears, output RESULT:CAPTCHA immediately\n\n"
+        )
+        prompt = continuation_header + prompt
 
     return prompt

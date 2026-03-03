@@ -266,6 +266,16 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
     logger.info("[worker-%d] Chrome cleaned up", worker_id)
 
 
+def detach_chrome(slot_id: int) -> None:
+    """Remove a Chrome process from cleanup tracking without killing it.
+
+    Used when leaving Chrome open for user intervention (e.g., CAPTCHA).
+    The caller is responsible for eventually killing the process.
+    """
+    with _chrome_lock:
+        _chrome_procs.pop(slot_id, None)
+
+
 def kill_all_chrome() -> None:
     """Kill all Chrome instances and any port zombies.
 

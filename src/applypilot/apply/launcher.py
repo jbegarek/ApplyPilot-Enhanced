@@ -25,15 +25,17 @@ from rich.live import Live
 
 from applypilot import config
 from applypilot.database import get_connection
+from applypilot.llm import UsageLimitError, _is_usage_limit_error
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
-    BASE_CDP_PORT,
+    detach_chrome, BASE_CDP_PORT,
 )
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
-    render_full, get_totals,
+    render_full, get_totals, record_job_result, get_job_results,
+    render_summary,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,10 @@ _stop_event = threading.Event()
 # Track active Claude Code processes for skip (Ctrl+C) handling
 _claude_procs: dict[int, subprocess.Popen] = {}
 _claude_lock = threading.Lock()
+
+# CAPTCHA-pending Chrome instances (left open for user intervention)
+_captcha_pending: list[dict] = []
+_captcha_lock = threading.Lock()
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -295,7 +301,8 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
+            model: str = "sonnet", dry_run: bool = False,
+            continuation: bool = False) -> tuple[str, int]:
     """Spawn a Claude Code session for one job application.
 
     Returns:
@@ -315,6 +322,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         job=job,
         tailored_resume=resume_text,
         dry_run=dry_run,
+        continuation=continuation,
     )
 
     # Write per-worker MCP config
@@ -456,6 +464,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
 
+        if returncode and _is_usage_limit_error(output):
+            raise UsageLimitError(
+                "Claude API usage limit reached during auto-apply",
+                raw_message=output[:2000],
+            )
+
         if stats:
             cost = stats.get("cost_usd", 0)
             ws = get_state(worker_id)
@@ -503,6 +517,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
         return "failed:timeout", duration_ms
+    except UsageLimitError:
+        raise
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
@@ -568,7 +584,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     continuous = limit == 0
     jobs_done = 0
     empty_polls = 0
-    port = BASE_CDP_PORT + worker_id
+    captcha_offset = 0
 
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
@@ -595,14 +611,22 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             continue
 
         empty_polls = 0
+        port = BASE_CDP_PORT + worker_id + (captcha_offset * 50)
+        slot_id = worker_id + (captcha_offset * 50)
 
         chrome_proc = None
+        leave_chrome_open = False
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+            chrome_proc = launch_chrome(slot_id, port=port, headless=headless)
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run)
+
+            duration_s = duration_ms // 1000
+            app_url = job.get("application_url") or job["url"]
+            base_result = result.split(":")[0] if ":" in result else result
+            reason = result.split(":", 1)[-1] if ":" in result else result
 
             if result == "skipped":
                 release_lock(job["url"])
@@ -613,14 +637,63 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
+                record_job_result(
+                    title=job["title"], company=job.get("site", ""),
+                    url=job["url"], application_url=app_url,
+                    score=job.get("fit_score", 0), result="applied",
+                    reason="", duration_s=duration_s, worker_id=worker_id,
+                )
+            elif base_result == "captcha":
+                # Leave Chrome open for user intervention, move to next job
+                mark_result(job["url"], "failed", "captcha_pending",
+                            permanent=False, duration_ms=duration_ms)
+                detach_chrome(slot_id)
+                with _captcha_lock:
+                    _captcha_pending.append({
+                        "job": job, "chrome_proc": chrome_proc,
+                        "port": port, "slot_id": slot_id,
+                        "worker_id": worker_id,
+                    })
+                leave_chrome_open = True
+                captcha_offset += 1
+                failed += 1
+                update_state(worker_id, jobs_failed=failed,
+                             jobs_done=applied + failed)
+                record_job_result(
+                    title=job["title"], company=job.get("site", ""),
+                    url=job["url"], application_url=app_url,
+                    score=job.get("fit_score", 0), result="captcha",
+                    reason=f"CAPTCHA — Chrome left open (port {port})",
+                    duration_s=duration_s, worker_id=worker_id,
+                )
+                add_event(f"[W{worker_id}] CAPTCHA (Chrome left open): {job['title'][:30]}")
+            elif base_result == "login_issue":
+                mark_result(job["url"], "failed", "login_issue",
+                            permanent=True, duration_ms=duration_ms)
+                failed += 1
+                update_state(worker_id, jobs_failed=failed,
+                             jobs_done=applied + failed)
+                record_job_result(
+                    title=job["title"], company=job.get("site", ""),
+                    url=job["url"], application_url=app_url,
+                    score=job.get("fit_score", 0), result="login_issue",
+                    reason=f"Login failed @ {job.get('site', '')} — {app_url[:60]}",
+                    duration_s=duration_s, worker_id=worker_id,
+                )
             else:
-                reason = result.split(":", 1)[-1] if ":" in result else result
                 mark_result(job["url"], "failed", reason,
                             permanent=_is_permanent_failure(result),
                             duration_ms=duration_ms)
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
+                record_job_result(
+                    title=job["title"], company=job.get("site", ""),
+                    url=job["url"], application_url=app_url,
+                    score=job.get("fit_score", 0), result=result,
+                    reason=reason, duration_s=duration_s,
+                    worker_id=worker_id,
+                )
 
         except KeyboardInterrupt:
             release_lock(job["url"])
@@ -628,6 +701,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 break
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
             continue
+        except UsageLimitError:
+            release_lock(job["url"])
+            raise
         except Exception as e:
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
@@ -635,14 +711,106 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
-            if chrome_proc:
-                cleanup_worker(worker_id, chrome_proc)
+            if chrome_proc and not leave_chrome_open:
+                cleanup_worker(slot_id, chrome_proc)
 
         jobs_done += 1
         if target_url:
             break
 
     update_state(worker_id, status="done", last_action="finished")
+    return applied, failed
+
+
+# ---------------------------------------------------------------------------
+# CAPTCHA intervention
+# ---------------------------------------------------------------------------
+
+def _handle_captcha_intervention(console: Console, model: str = "sonnet",
+                                 dry_run: bool = False) -> tuple[int, int]:
+    """Prompt user to solve CAPTCHAs in open Chrome windows, then retry.
+
+    After normal processing, any CAPTCHA-blocked jobs have their Chrome
+    windows left open. This function lets the user manually clear CAPTCHAs,
+    then re-runs the agent to continue the application.
+
+    Returns:
+        Tuple of (applied_count, failed_count) from retry attempts.
+    """
+    with _captcha_lock:
+        pending = list(_captcha_pending)
+
+    if not pending:
+        return 0, 0
+
+    console.print(f"\n[yellow bold]CAPTCHA Intervention: "
+                  f"{len(pending)} Chrome window(s) left open[/yellow bold]")
+    for i, item in enumerate(pending, 1):
+        job = item["job"]
+        console.print(f"  {i}. [bold]{job['title']}[/bold] @ {job.get('site', 'unknown')} "
+                      f"(port {item['port']})")
+
+    console.print("\n[bold]Solve the CAPTCHAs in the open Chrome windows.[/bold]")
+    console.print("Press [green]Enter[/green] when done to retry applications, "
+                  "or type [red]q[/red]+Enter to quit and close windows.")
+
+    try:
+        user_input = input(">>> ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        user_input = "q"
+
+    applied = 0
+    failed = 0
+
+    if user_input != "q":
+        for item in pending:
+            job = item["job"]
+            port = item["port"]
+            wid = item["worker_id"]
+
+            console.print(f"\n[yellow]Retrying: {job['title']} @ "
+                          f"{job.get('site', '')}...[/yellow]")
+
+            try:
+                result, duration_ms = run_job(
+                    job, port=port, worker_id=wid,
+                    model=model, dry_run=dry_run, continuation=True,
+                )
+
+                app_url = job.get("application_url") or job["url"]
+                if result == "applied":
+                    mark_result(job["url"], "applied", duration_ms=duration_ms)
+                    applied += 1
+                    console.print(f"  [green bold]APPLIED[/green bold]")
+                    record_job_result(
+                        title=job["title"], company=job.get("site", ""),
+                        url=job["url"], application_url=app_url,
+                        score=job.get("fit_score", 0), result="applied",
+                        reason="CAPTCHA cleared by user",
+                        duration_s=duration_ms // 1000, worker_id=wid,
+                    )
+                else:
+                    reason = result.split(":", 1)[-1] if ":" in result else result
+                    mark_result(job["url"], "failed", reason,
+                                permanent=_is_permanent_failure(result),
+                                duration_ms=duration_ms)
+                    failed += 1
+                    console.print(f"  [red]FAILED: {reason}[/red]")
+            except UsageLimitError:
+                raise
+            except Exception as e:
+                console.print(f"  [red]ERROR: {e}[/red]")
+                failed += 1
+
+    # Cleanup all CAPTCHA Chrome instances
+    for item in pending:
+        proc = item.get("chrome_proc")
+        if proc and proc.poll() is None:
+            _kill_process_tree(proc.pid)
+
+    with _captcha_lock:
+        _captcha_pending.clear()
+
     return applied, failed
 
 
@@ -769,6 +937,9 @@ def main(limit: int = 1, target_url: str | None = None,
                         wid = futures[future]
                         try:
                             results.append(future.result())
+                        except UsageLimitError:
+                            _stop_event.set()
+                            raise
                         except Exception:
                             logger.exception("Worker %d crashed", wid)
                             results.append((0, 0))
@@ -787,8 +958,38 @@ def main(limit: int = 1, target_url: str | None = None,
         )
         console.print(f"Logs: {config.LOG_DIR}")
 
+        # Detailed summary table
+        summary_table = render_summary()
+        if summary_table.row_count:
+            console.print()
+            console.print(summary_table)
+
+        # Login issue details — tell user exactly where to fix credentials
+        results = get_job_results()
+        login_issues = [r for r in results if r.result == "login_issue"]
+        if login_issues:
+            console.print("\n[red bold]LOGIN ISSUES — fix credentials for these sites:[/red bold]")
+            for r in login_issues:
+                console.print(f"  [bold]{r.company}[/bold] — {r.application_url}")
+                console.print(f"    Job: {r.title} | URL: {r.url}")
+
+        # CAPTCHA intervention — retry jobs with user-cleared CAPTCHAs
+        captcha_applied, captcha_failed = _handle_captcha_intervention(
+            console, model=model, dry_run=dry_run)
+        if captcha_applied:
+            total_applied += captcha_applied
+            console.print(f"\n[green bold]CAPTCHA retries: {captcha_applied} applied, "
+                          f"{captcha_failed} failed[/green bold]")
+
     except KeyboardInterrupt:
         pass
     finally:
         _stop_event.set()
+        # Clean up any CAPTCHA Chrome instances still pending
+        with _captcha_lock:
+            for item in _captcha_pending:
+                proc = item.get("chrome_proc")
+                if proc and proc.poll() is None:
+                    _kill_process_tree(proc.pid)
+            _captcha_pending.clear()
         kill_all_chrome()

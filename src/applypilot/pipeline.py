@@ -23,6 +23,8 @@ from rich.table import Table
 
 from applypilot.config import load_env, ensure_dirs
 from applypilot.database import init_db, get_connection, get_stats
+from applypilot.llm import UsageLimitError
+from applypilot.session import save_session, estimate_reset_time
 
 log = logging.getLogger(__name__)
 console = Console()
@@ -116,6 +118,8 @@ def _run_score() -> dict:
         from applypilot.scoring.scorer import run_scoring
         run_scoring()
         return {"status": "ok"}
+    except UsageLimitError:
+        raise
     except Exception as e:
         log.error("Scoring failed: %s", e)
         return {"status": f"error: {e}"}
@@ -127,6 +131,8 @@ def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
         from applypilot.scoring.tailor import run_tailoring
         run_tailoring(min_score=min_score, validation_mode=validation_mode)
         return {"status": "ok"}
+    except UsageLimitError:
+        raise
     except Exception as e:
         log.error("Tailoring failed: %s", e)
         return {"status": f"error: {e}"}
@@ -138,6 +144,8 @@ def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
         from applypilot.scoring.cover_letter import run_cover_letters
         run_cover_letters(min_score=min_score, validation_mode=validation_mode)
         return {"status": "ok"}
+    except UsageLimitError:
+        raise
     except Exception as e:
         log.error("Cover letter generation failed: %s", e)
         return {"status": f"error: {e}"}
@@ -303,6 +311,8 @@ def _run_stage_streaming(
             try:
                 runner(**kwargs)
                 passes += 1
+            except UsageLimitError:
+                raise
             except Exception as e:
                 log.error("Stage '%s' error (pass %d): %s", stage, passes, e)
                 passes += 1
@@ -330,7 +340,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
     errors: dict[str, str] = {}
     pipeline_start = time.time()
 
-    for name in ordered:
+    for idx, name in enumerate(ordered):
         meta = STAGE_META[name]
         console.print(f"\n{'=' * 70}")
         console.print(f"  [bold]STAGE: {name}[/bold] — {meta['desc']}")
@@ -361,6 +371,39 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                     if sub_errors:
                         status = "partial"
 
+        except UsageLimitError as ule:
+            elapsed = time.time() - t0
+            status = "usage_limit"
+            log.warning("Usage limit hit during stage '%s': %s", name, ule)
+
+            # Save session with remaining stages (current + remaining)
+            remaining = ordered[idx:]
+            reset_at = estimate_reset_time(ule.raw_message)
+            save_session(
+                command="run",
+                args={
+                    "stages": ordered,
+                    "min_score": min_score,
+                    "workers": workers,
+                    "validation_mode": validation_mode,
+                },
+                remaining_stages=remaining,
+                reason="usage_limit",
+                reset_at=reset_at,
+            )
+
+            results.append({"stage": name, "status": status, "elapsed": elapsed})
+            errors[name] = status
+            total_elapsed = time.time() - pipeline_start
+            return {
+                "stages": results,
+                "errors": errors,
+                "elapsed": total_elapsed,
+                "usage_limit": True,
+                "reset_at": reset_at,
+                "remaining_stages": remaining,
+            }
+
         except Exception as e:
             elapsed = time.time() - t0
             status = f"error: {e}"
@@ -383,6 +426,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
     tracker = _StageTracker()
     stop_event = threading.Event()
     pipeline_start = time.time()
+    usage_limit_info: dict = {}  # populated if a thread hits a usage limit
 
     console.print(f"\n  [bold cyan]STREAMING MODE[/bold cyan] — stages run concurrently")
     console.print(f"  Poll interval: {_STREAM_POLL_INTERVAL}s\n")
@@ -392,6 +436,21 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
         if stage not in ordered:
             tracker.mark_done(stage, {"status": "skipped"})
 
+    def _streaming_wrapper(name: str) -> None:
+        """Wrapper that catches UsageLimitError in streaming threads."""
+        try:
+            _run_stage_streaming(name, tracker, stop_event, min_score, workers, validation_mode)
+        except UsageLimitError as ule:
+            nonlocal usage_limit_info
+            usage_limit_info = {
+                "stage": name,
+                "raw_message": ule.raw_message,
+                "reset_at": estimate_reset_time(ule.raw_message),
+            }
+            log.warning("Usage limit hit in streaming stage '%s': %s", name, ule)
+            stop_event.set()  # signal all other threads to stop
+            tracker.mark_done(name, {"status": "usage_limit"})
+
     # Launch each stage in its own thread
     threads: dict[str, threading.Thread] = {}
     start_times: dict[str, float] = {}
@@ -399,8 +458,8 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
     for name in ordered:
         start_times[name] = time.time()
         t = threading.Thread(
-            target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, workers, validation_mode),
+            target=_streaming_wrapper,
+            args=(name,),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -438,7 +497,29 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
         if status not in ("ok", "partial", "skipped"):
             errors[name] = status
 
-    return {"stages": results, "errors": errors, "elapsed": total_elapsed}
+    result = {"stages": results, "errors": errors, "elapsed": total_elapsed}
+
+    # If a usage limit was hit, save session and annotate the result
+    if usage_limit_info:
+        reset_at = usage_limit_info.get("reset_at")
+        # In streaming mode, all stages run concurrently so "remaining" = ordered
+        save_session(
+            command="run",
+            args={
+                "stages": ordered,
+                "min_score": min_score,
+                "workers": workers,
+                "validation_mode": validation_mode,
+                "stream": True,
+            },
+            remaining_stages=ordered,
+            reason="usage_limit",
+            reset_at=reset_at,
+        )
+        result["usage_limit"] = True
+        result["reset_at"] = reset_at
+
+    return result
 
 
 def run_pipeline(
@@ -486,6 +567,15 @@ def run_pipeline(
     # Pre-run stats
     pre_stats = get_stats()
     console.print(f"  DB:        {pre_stats['total']} jobs, {pre_stats['pending_detail']} pending enrichment")
+    console.print(
+        "  Pending:   "
+        f"enrich={pre_stats['pending_by_stage']['enrich']}, "
+        f"score={pre_stats['pending_by_stage']['score']}, "
+        f"tailor={pre_stats['pending_by_stage']['tailor']}, "
+        f"cover={pre_stats['pending_by_stage']['cover']}, "
+        f"pdf={pre_stats['pending_by_stage']['pdf']}, "
+        f"apply={pre_stats['pending_by_stage']['apply']}"
+    )
 
     if dry_run:
         console.print(f"\n  [yellow]DRY RUN[/yellow] — would execute ({mode}):")
@@ -535,6 +625,14 @@ def run_pipeline(
     console.print(f"    Cover letters:  {final['with_cover_letter']}")
     console.print(f"    Ready to apply: {final['ready_to_apply']}")
     console.print(f"    Applied:        {final['applied']}")
+    console.print("    Pending by stage:")
+    console.print(f"      enrich:       {final['pending_by_stage']['enrich']}")
+    console.print(f"      score:        {final['pending_by_stage']['score']}")
+    console.print(f"      tailor:       {final['pending_by_stage']['tailor']}")
+    console.print(f"      cover:        {final['pending_by_stage']['cover']}")
+    console.print(f"      pdf:          {final['pending_by_stage']['pdf']}")
+    console.print(f"      apply:        {final['pending_by_stage']['apply']}")
+    console.print(f"    Next stage:     {final['next_stage_to_run']}")
     console.print(f"{'=' * 70}\n")
 
     return result

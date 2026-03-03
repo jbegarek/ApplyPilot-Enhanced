@@ -232,7 +232,9 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         Dictionary with keys:
             total, by_site, pending_detail, with_description,
             scored, unscored, tailored, untailored_eligible,
-            with_cover_letter, applied, score_distribution
+            with_cover_letter, applied, score_distribution,
+            pending_cover, pending_pdf, pending_apply,
+            pending_by_stage, next_stage_to_run
     """
     if conn is None:
         conn = get_connection()
@@ -287,7 +289,8 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     stats["untailored_eligible"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
         "WHERE fit_score >= 7 AND full_description IS NOT NULL "
-        "AND tailored_resume_path IS NULL"
+        "AND tailored_resume_path IS NULL "
+        "AND COALESCE(tailor_attempts, 0) < 5"
     ).fetchone()[0]
 
     stats["tailor_exhausted"] = conn.execute(
@@ -322,6 +325,37 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "AND applied_at IS NULL "
         "AND application_url IS NOT NULL"
     ).fetchone()[0]
+
+    # Additional pending counts to make stage backlog explicit
+    stats["pending_cover"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs "
+        "WHERE tailored_resume_path IS NOT NULL "
+        "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
+        "AND COALESCE(cover_attempts, 0) < 5"
+    ).fetchone()[0]
+
+    stats["pending_pdf"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs "
+        "WHERE tailored_resume_path IS NOT NULL "
+        "AND tailored_resume_path LIKE '%.txt'"
+    ).fetchone()[0]
+
+    stats["pending_apply"] = stats["ready_to_apply"]
+
+    stats["pending_by_stage"] = {
+        "enrich": stats["pending_detail"],
+        "score": stats["unscored"],
+        "tailor": stats["untailored_eligible"],
+        "cover": stats["pending_cover"],
+        "pdf": stats["pending_pdf"],
+        "apply": stats["pending_apply"],
+    }
+
+    stats["next_stage_to_run"] = "none"
+    for stage in ("enrich", "score", "tailor", "cover", "pdf", "apply"):
+        if stats["pending_by_stage"][stage] > 0:
+            stats["next_stage_to_run"] = stage
+            break
 
     return stats
 

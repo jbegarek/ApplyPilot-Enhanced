@@ -31,7 +31,7 @@ from playwright.sync_api import sync_playwright
 from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db, store_jobs, get_stats
-from applypilot.llm import get_client
+from applypilot.llm import UsageLimitError, get_client
 
 log = logging.getLogger(__name__)
 
@@ -795,6 +795,8 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
 
     try:
         raw, elapsed, meta = ask_llm(prompt)
+    except UsageLimitError:
+        raise
     except Exception as e:
         log.error("LLM_ERROR in Phase 2: %s", e)
         return {}, []
@@ -889,6 +891,8 @@ def _run_one_site(name: str, url: str) -> dict:
     prompt = STRATEGY_PROMPT.format(briefing=briefing)
     try:
         raw, elapsed, meta = ask_llm(prompt)
+    except UsageLimitError:
+        raise
     except Exception as e:
         log.error("LLM_ERROR: %s", e)
         return {"name": name, "status": "LLM_ERROR", "error": str(e)}

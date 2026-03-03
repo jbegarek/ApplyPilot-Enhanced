@@ -38,11 +38,28 @@ class WorkerState:
     log_file: Path | None = None
 
 
+@dataclass
+class JobResult:
+    """Tracks the outcome of a single job application attempt."""
+
+    title: str
+    company: str
+    url: str
+    application_url: str
+    score: int
+    result: str
+    reason: str
+    duration_s: int
+    worker_id: int
+    log_file: str = ""
+
+
 # Module-level state (thread-safe via _lock)
 _worker_states: dict[int, WorkerState] = {}
 _events: list[str] = []
 _lock = threading.Lock()
 MAX_EVENTS = 8
+_job_results: list[JobResult] = []
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +103,24 @@ def add_event(msg: str) -> None:
         _events.append(f"[dim]{ts}[/dim] {msg}")
         if len(_events) > MAX_EVENTS:
             _events.pop(0)
+
+
+def record_job_result(**kwargs) -> None:
+    """Record the outcome of a job application attempt."""
+    with _lock:
+        _job_results.append(JobResult(**kwargs))
+
+
+def get_job_results() -> list[JobResult]:
+    """Get all recorded job results."""
+    with _lock:
+        return list(_job_results)
+
+
+def clear_job_results() -> None:
+    """Clear all recorded job results."""
+    with _lock:
+        _job_results.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -201,3 +236,49 @@ def get_totals() -> dict[str, int | float]:
         failed = sum(s.jobs_failed for s in _worker_states.values())
         cost = sum(s.total_cost for s in _worker_states.values())
     return {"applied": applied, "failed": failed, "cost": cost}
+
+
+def render_summary() -> Table:
+    """Build a Rich table summarizing all job application results."""
+    results = get_job_results()
+    if not results:
+        return Table()
+
+    table = Table(title="Application Summary", expand=True, show_lines=True)
+    table.add_column("#", width=3, justify="right", style="dim")
+    table.add_column("Result", width=12, justify="center")
+    table.add_column("Company", min_width=15, max_width=25, no_wrap=True)
+    table.add_column("Title", min_width=20, max_width=35, no_wrap=True)
+    table.add_column("Score", width=5, justify="center")
+    table.add_column("Time", width=6, justify="right")
+    table.add_column("Reason / Detail", min_width=20, max_width=50)
+
+    _RESULT_STYLES = {
+        "applied": "bold green",
+        "captcha": "magenta",
+        "login_issue": "bold red",
+        "expired": "dim red",
+        "failed": "red",
+        "skipped": "dim",
+    }
+
+    for i, r in enumerate(results, 1):
+        base_result = r.result.split(":")[0] if ":" in r.result else r.result
+        style = _RESULT_STYLES.get(base_result, "")
+        result_display = base_result.upper()
+
+        reason_display = r.reason if r.reason and r.reason != r.result else ""
+        if base_result == "login_issue" and r.application_url:
+            reason_display = f"Login failed @ {r.application_url[:50]}"
+
+        table.add_row(
+            str(i),
+            Text(result_display, style=style),
+            r.company[:25],
+            r.title[:35],
+            f"{r.score}/10" if r.score else "",
+            f"{r.duration_s}s",
+            reason_display[:50],
+        )
+
+    return table

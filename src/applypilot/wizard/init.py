@@ -4,7 +4,7 @@ Interactive flow that creates ~/.applypilot/ with:
   - resume.txt (and optionally resume.pdf)
   - profile.json
   - searches.yaml
-  - .env (LLM API key)
+  - .env (optional CapSolver key)
 """
 
 from __future__ import annotations
@@ -234,45 +234,25 @@ def _setup_searches() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_ai_features() -> None:
-    """Ask about AI scoring/tailoring — optional LLM configuration."""
+    """Check for Claude Code CLI — required for AI scoring/tailoring."""
     console.print(Panel(
-        "[bold]Step 4: AI Features (optional)[/bold]\n"
-        "An LLM powers job scoring, resume tailoring, and cover letters.\n"
-        "Without this, you can still discover and enrich jobs."
+        "[bold]Step 4: AI Features[/bold]\n"
+        "ApplyPilot uses Claude Code CLI for job scoring, resume tailoring, and cover letters.\n"
+        "No separate API keys needed — runs on your Claude Code subscription."
     ))
 
-    if not Confirm.ask("Enable AI scoring and resume tailoring?", default=True):
-        console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
-        return
-
-    console.print("Supported providers: [bold]Gemini[/bold] (recommended, free tier), OpenAI, local (Ollama/llama.cpp)")
-    provider = Prompt.ask(
-        "Provider",
-        choices=["gemini", "openai", "local"],
-        default="gemini",
-    )
-
-    env_lines = ["# ApplyPilot configuration", ""]
-
-    if provider == "gemini":
-        api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
-        model = Prompt.ask("Model", default="gemini-2.0-flash")
-        env_lines.append(f"GEMINI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
-    elif provider == "openai":
-        api_key = Prompt.ask("OpenAI API key")
-        model = Prompt.ask("Model", default="gpt-4o-mini")
-        env_lines.append(f"OPENAI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
-    elif provider == "local":
-        url = Prompt.ask("Local LLM endpoint URL", default="http://localhost:8080/v1")
-        model = Prompt.ask("Model name", default="local-model")
-        env_lines.append(f"LLM_URL={url}")
-        env_lines.append(f"LLM_MODEL={model}")
-
-    env_lines.append("")
-    ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
-    console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
+    if shutil.which("claude"):
+        console.print("[green]Claude Code CLI detected — AI features are ready.[/green]")
+        model = Prompt.ask("Claude model to use", default="sonnet")
+        env_lines = ["# ApplyPilot configuration", "", f"LLM_MODEL={model}", ""]
+        ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
+        console.print(f"[green]Model preference saved to {ENV_PATH}[/green]")
+    else:
+        console.print(
+            "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
+            "Install it from: [bold]https://claude.ai/code[/bold]\n"
+            "AI features (scoring, tailoring, cover letters) won't work until it's installed."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -378,9 +358,9 @@ def run_wizard() -> None:
 
     unlock_hint = ""
     if tier == 1:
-        unlock_hint = "\n[dim]To unlock Tier 2: configure an LLM API key (re-run [bold]applypilot init[/bold]).[/dim]"
+        unlock_hint = "\n[dim]To unlock Tier 2: install Claude Code CLI from https://claude.ai/code[/dim]"
     elif tier == 2:
-        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
+        unlock_hint = "\n[dim]To unlock Tier 3: install Chrome.[/dim]"
 
     console.print(
         Panel.fit(

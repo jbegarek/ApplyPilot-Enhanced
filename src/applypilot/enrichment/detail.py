@@ -25,7 +25,7 @@ from playwright.sync_api import sync_playwright
 from applypilot import config
 from applypilot.config import DB_PATH
 from applypilot.database import get_connection, init_db, ensure_columns
-from applypilot.llm import get_client
+from applypilot.llm import UsageLimitError, get_client
 
 log = logging.getLogger(__name__)
 
@@ -478,6 +478,8 @@ def extract_with_llm(page, url: str) -> dict:
             desc = clean_description(desc)
 
         return {"full_description": desc, "application_url": apply_url}
+    except UsageLimitError:
+        raise
     except Exception as e:
         log.error("LLM ERROR: %s", e)
         return {"full_description": None, "application_url": None}

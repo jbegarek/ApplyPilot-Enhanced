@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from applypilot.config import RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.llm import get_client
+from applypilot.llm import UsageLimitError, get_client
 
 log = logging.getLogger(__name__)
 
@@ -23,22 +23,58 @@ log = logging.getLogger(__name__)
 SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume and a job description, score how well the candidate fits the role.
 
 SCORING CRITERIA:
-- 9-10: Perfect match. Candidate has direct experience in nearly all required skills and qualifications.
-- 7-8: Strong match. Candidate has most required skills, minor gaps easily bridged.
+- 9-10: Perfect match. Candidate has direct experience in nearly all required skills and qualifications. PAID position with clear job responsibilities.
+- 7-8: Strong match. Candidate has most required skills, minor gaps easily bridged. PAID position.
 - 5-6: Moderate match. Candidate has some relevant skills but missing key requirements.
 - 3-4: Weak match. Significant skill gaps, would need substantial ramp-up.
 - 1-2: Poor match. Completely different field or experience level.
+
+AUTOMATIC LOW SCORE (score 1-2):
+- Volunteer, unpaid, or pro-bono positions
+- Training, mentoring, or classroom speaker roles (unless it is a paid training position)
+- Non-English job postings
+- Unpaid internships or roles with no compensation listed that appear to be unpaid
+- Roles that are clearly not a real employment opportunity (e.g., beta testing invitations, community calls for participation)
+
+CANDIDATE PREFERENCES (factor into your score):
+- STRONGLY prefers remote positions. A remote role with good skill fit should score 1 point higher than an equivalent onsite role.
+- ESPECIALLY values part-time positions. A paid part-time role with good skill fit should score 1 point higher than an equivalent full-time role.
+- These bonuses stack: a remote part-time role with good skill match should score up to 2 points higher.
+- The candidate is open to full-time, part-time, or contract work, as long as it is PAID.
 
 IMPORTANT FACTORS:
 - Weight technical skills heavily (programming languages, frameworks, tools)
 - Consider transferable experience (automation, scripting, API work)
 - Factor in the candidate's project experience
 - Be realistic about experience level vs. job requirements (years of experience, seniority)
+- The candidate is seeking PAID employment (full-time or part-time). Score unpaid/volunteer roles as 1-2 regardless of skill match.
 
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
 REASONING: [2-3 sentences explaining the score]"""
+
+
+_REMOTE_SIGNALS = {"remote", "anywhere", "work from home", "wfh", "distributed", "telecommute", "telework"}
+_PARTTIME_SIGNALS = {"part-time", "part time", "parttime", "20 hours", "half-time", "halftime"}
+
+
+def _preference_boost(job: dict) -> int:
+    """Detect remote and part-time signals in job data and return a score boost.
+
+    Returns 0, 1, or 2 (remote +1, part-time +1, stacking).
+    """
+    loc = (job.get("location") or "").lower()
+    title = (job.get("title") or "").lower()
+    desc = (job.get("full_description") or "")[:3000].lower()
+    combined = f"{loc} {title} {desc}"
+
+    boost = 0
+    if any(s in combined for s in _REMOTE_SIGNALS):
+        boost += 1
+    if any(s in combined for s in _PARTTIME_SIGNALS):
+        boost += 1
+    return boost
 
 
 def _parse_score_response(response: str) -> dict:
@@ -95,7 +131,26 @@ def score_job(resume_text: str, job: dict) -> dict:
     try:
         client = get_client()
         response = client.chat(messages, max_tokens=512, temperature=0.2)
-        return _parse_score_response(response)
+        result = _parse_score_response(response)
+
+        # Apply preference boost for remote/part-time (caps at 10)
+        boost = _preference_boost(job)
+        if boost > 0 and result["score"] >= 3:
+            old = result["score"]
+            result["score"] = min(10, result["score"] + boost)
+            if result["score"] != old:
+                tags = []
+                if any(s in (job.get("location") or "").lower() + " " + (job.get("full_description") or "")[:3000].lower()
+                       for s in _REMOTE_SIGNALS):
+                    tags.append("remote")
+                if any(s in (job.get("title") or "").lower() + " " + (job.get("full_description") or "")[:3000].lower()
+                       for s in _PARTTIME_SIGNALS):
+                    tags.append("part-time")
+                result["reasoning"] += f" [+{boost} preference boost: {', '.join(tags)}]"
+
+        return result
+    except UsageLimitError:
+        raise
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
