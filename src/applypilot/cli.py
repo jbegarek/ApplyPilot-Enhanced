@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from typing import Optional
@@ -30,6 +31,7 @@ log = logging.getLogger(__name__)
 
 # Valid pipeline stages (in execution order)
 VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+VALID_LLM_PROVIDERS = ("claude", "gemini", "openai", "codex")
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +136,35 @@ def _build_stage_progress_rows(stats: dict) -> list[tuple[str, int, int, int]]:
     ]
 
 
+def _set_llm_provider_override(llm: str | None) -> str:
+    """Validate and set provider override; return active provider."""
+    if llm:
+        provider = llm.lower()
+        if provider not in VALID_LLM_PROVIDERS:
+            console.print(f"[red]Unknown --llm value:[/red] '{llm}'. Choose: {', '.join(VALID_LLM_PROVIDERS)}")
+            raise typer.Exit(code=1)
+        os.environ["LLM_PROVIDER"] = provider
+        return provider
+    return os.environ.get("LLM_PROVIDER", "claude").lower()
+
+
+def _ensure_llm_provider_ready(provider: str) -> None:
+    """Verify the selected provider can run LLM stages."""
+    if provider == "claude":
+        from applypilot.config import check_tier
+        check_tier(2, "AI scoring/tailoring")
+        return
+
+    from applypilot.llm import _make_client
+
+    try:
+        client = _make_client("general")
+        client.close()
+    except Exception as exc:
+        console.print(f"[red]LLM provider '{provider}' is not ready:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -183,8 +214,19 @@ def run(
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
+    show_browser: bool = typer.Option(False, "--show-browser", help="Show browser window during enrichment (helps bypass bot detection)."),
+    reset_enrich_errors: bool = typer.Option(False, "--reset-enrich-errors", help="Clear enrichment errors so failed jobs are retried."),
+    llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
 ) -> None:
-    """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
+    """Run pipeline stages: discover, enrich, score, tailor, cover, pdf.
+
+    Examples:
+    - applypilot run enrich score tailor --show-browser
+    - applypilot run --reset-enrich-errors enrich
+    - applypilot run score tailor cover --llm openai
+    """
+    provider = _set_llm_provider_override(llm)
+
     _bootstrap()
 
     from applypilot.pipeline import run_pipeline
@@ -216,11 +258,25 @@ def run(
                 stream = True
             if validation == "normal" and "validation_mode" in saved_args:
                 validation = saved_args["validation_mode"]
+            if llm is None and "llm_provider" in saved_args:
+                provider = _set_llm_provider_override(saved_args["llm_provider"])
 
             clear_session()
             console.print("[green]Session restored. Cleared saved state.[/green]\n")
 
     stage_list = stages if stages else ["all"]
+
+    # Reset enrichment errors if requested
+    if reset_enrich_errors:
+        from applypilot.database import get_connection
+        conn = get_connection()
+        result_reset = conn.execute(
+            "UPDATE jobs SET detail_scraped_at = NULL, detail_error = NULL "
+            "WHERE detail_error IS NOT NULL"
+        )
+        conn.commit()
+        conn.close()
+        console.print(f"[cyan]Reset {result_reset.rowcount} enrichment error job(s) for retry.[/cyan]")
 
     # Validate stage names
     for s in stage_list:
@@ -234,8 +290,7 @@ def run(
     # Gate AI stages behind Tier 2
     llm_stages = {"score", "tailor", "cover"}
     if any(s in stage_list for s in llm_stages) or "all" in stage_list:
-        from applypilot.config import check_tier
-        check_tier(2, "AI scoring/tailoring")
+        _ensure_llm_provider_ready(provider)
 
     # Validate the --validation flag value
     valid_modes = ("strict", "normal", "lenient")
@@ -253,6 +308,7 @@ def run(
         stream=stream,
         workers=workers,
         validation_mode=validation,
+        headless=not show_browser,
     )
 
     # Check if we stopped due to usage limit
@@ -273,6 +329,11 @@ def apply(
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
+    live_chrome_profile: bool = typer.Option(
+        False,
+        "--live-chrome-profile",
+        help="Use your real Chrome profile dir instead of isolated worker clones.",
+    ),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
@@ -280,7 +341,14 @@ def apply(
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
 ) -> None:
-    """Launch auto-apply to submit job applications."""
+    """Launch auto-apply to submit job applications.
+
+    Utility examples:
+    - applypilot apply --mark-applied URL
+    - applypilot apply --mark-failed URL --fail-reason "captcha"
+    - applypilot apply --reset-failed
+    - applypilot apply --gen --url URL
+    """
     _bootstrap()
 
     from applypilot.config import check_tier, PROFILE_PATH as _profile_path
@@ -363,6 +431,7 @@ def apply(
     console.print(f"  Workers:  {workers}")
     console.print(f"  Model:    {model}")
     console.print(f"  Headless: {headless}")
+    console.print(f"  Live profile: {live_chrome_profile}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
         console.print(f"  Target:   {url}")
@@ -378,6 +447,7 @@ def apply(
             dry_run=dry_run,
             continuous=continuous,
             workers=workers,
+            use_real_profile=live_chrome_profile,
         )
     except UsageLimitError as ule:
         reset_at = estimate_reset_time(ule.raw_message)
@@ -388,6 +458,7 @@ def apply(
                 "target_url": url,
                 "min_score": min_score,
                 "headless": headless,
+                "live_chrome_profile": live_chrome_profile,
                 "model": model,
                 "dry_run": dry_run,
                 "continuous": continuous,
@@ -401,7 +472,9 @@ def apply(
 
 
 @app.command()
-def resume() -> None:
+def resume(
+    llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
+) -> None:
     """Resume the last saved pipeline session.
 
     Equivalent to running the original command with --resume.
@@ -436,6 +509,11 @@ def resume() -> None:
         from applypilot.pipeline import run_pipeline
 
         stage_list = remaining or saved_args.get("stages", ["all"])
+        provider = saved_args.get("llm_provider")
+        if llm is None and provider:
+            _set_llm_provider_override(provider)
+        elif llm is not None:
+            _set_llm_provider_override(llm)
 
         result = run_pipeline(
             stages=stage_list,
@@ -463,6 +541,7 @@ def resume() -> None:
             "target_url": saved_args.get("target_url"),
             "min_score": saved_args.get("min_score", 7),
             "headless": saved_args.get("headless", False),
+            "use_real_profile": saved_args.get("live_chrome_profile", False),
             "model": saved_args.get("model", "haiku"),
             "dry_run": saved_args.get("dry_run", False),
             "continuous": saved_args.get("continuous", False),

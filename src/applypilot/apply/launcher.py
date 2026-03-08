@@ -143,7 +143,11 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   AND fit_score >= ?
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                ORDER BY
+                  COALESCE(apply_attempts, 0) ASC,
+                  CASE WHEN apply_status IS NULL THEN 0 ELSE 1 END ASC,
+                  fit_score DESC,
+                  url
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
@@ -564,7 +568,8 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "sonnet", dry_run: bool = False,
+                use_real_profile: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -575,6 +580,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         headless: Run Chrome headless.
         model: Claude model name.
         dry_run: Don't click Submit.
+        use_real_profile: Launch Chrome against the user's real profile dir.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -618,7 +624,12 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         leave_chrome_open = False
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(slot_id, port=port, headless=headless)
+            chrome_proc = launch_chrome(
+                slot_id,
+                port=port,
+                headless=headless,
+                use_real_profile=use_real_profile,
+            )
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run)
@@ -821,7 +832,8 @@ def _handle_captcha_intervention(console: Console, model: str = "sonnet",
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1) -> None:
+         poll_interval: int = 60, workers: int = 1,
+         use_real_profile: bool = False) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -834,6 +846,7 @@ def main(limit: int = 1, target_url: str | None = None,
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
+        use_real_profile: Launch Chrome against the user's real profile dir.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -905,6 +918,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     model=model,
                     dry_run=dry_run,
+                    use_real_profile=use_real_profile,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -928,6 +942,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run,
+                            use_real_profile=use_real_profile,
                         ): i
                         for i in range(workers)
                     }

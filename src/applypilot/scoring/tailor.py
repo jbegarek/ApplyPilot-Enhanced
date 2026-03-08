@@ -20,7 +20,7 @@ from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.llm import ClaudeCLIClient, UsageLimitError, get_client
+from applypilot.llm import ClaudeCLIClient, UsageLimitError, get_client, get_tailor_client
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     FABRICATION_WATCHLIST,
@@ -55,22 +55,15 @@ def _safe_write(path: Path, content: str, retries: int = 3) -> None:
                 raise
 
 
-# ── Opus Client for Tailoring ────────────────────────────────────────────
+# ── Tailor Client (provider-aware) ───────────────────────────────────────
 
-_tailor_client: ClaudeCLIClient | None = None
+def _get_tailor_client():
+    """Return the high-quality LLM client for the tailoring stage.
 
-
-def _get_tailor_client() -> ClaudeCLIClient:
-    """Return a dedicated Opus client for the tailoring stage.
-
-    Uses Claude Opus for higher-quality bullet reframing and more natural voice.
-    All other stages (scoring, cover letters, judge) continue using Sonnet.
+    Delegates to llm.get_tailor_client() which selects the best model
+    for the active provider (Opus for Claude, Pro for Gemini, GPT-4o for OpenAI).
     """
-    global _tailor_client
-    if _tailor_client is None:
-        _tailor_client = ClaudeCLIClient(model="claude-opus-4-6")
-        log.info("Tailor LLM: Claude Opus 4.6 (dedicated)")
-    return _tailor_client
+    return get_tailor_client()
 
 
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────

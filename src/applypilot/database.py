@@ -219,6 +219,33 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
     return added
 
 
+def count_pending_pdf(conn: sqlite3.Connection | None = None) -> int:
+    """Count tailored resume text files that are still missing a PDF sibling."""
+    if conn is None:
+        conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT tailored_resume_path FROM jobs "
+        "WHERE tailored_resume_path IS NOT NULL "
+        "AND tailored_resume_path LIKE '%.txt'"
+    ).fetchall()
+
+    pending = 0
+    for row in rows:
+        raw_path = (row[0] or "").strip()
+        if not raw_path:
+            continue
+        txt_path = Path(raw_path).expanduser()
+        pdf_path = txt_path.with_suffix(".pdf")
+        try:
+            if not pdf_path.exists():
+                pending += 1
+        except OSError:
+            # Unreadable/invalid path should remain pending for visibility.
+            pending += 1
+    return pending
+
+
 def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     """Return job counts by pipeline stage.
 
@@ -334,11 +361,7 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "AND COALESCE(cover_attempts, 0) < 5"
     ).fetchone()[0]
 
-    stats["pending_pdf"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs "
-        "WHERE tailored_resume_path IS NOT NULL "
-        "AND tailored_resume_path LIKE '%.txt'"
-    ).fetchone()[0]
+    stats["pending_pdf"] = count_pending_pdf(conn)
 
     stats["pending_apply"] = stats["ready_to_apply"]
 

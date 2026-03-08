@@ -13,6 +13,7 @@ Usage (via CLI):
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime
@@ -22,7 +23,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from applypilot.config import load_env, ensure_dirs
-from applypilot.database import init_db, get_connection, get_stats
+from applypilot.database import count_pending_pdf, init_db, get_connection, get_stats
 from applypilot.llm import UsageLimitError
 from applypilot.session import save_session, estimate_reset_time
 
@@ -101,11 +102,11 @@ def _run_discover(workers: int = 1) -> dict:
     return stats
 
 
-def _run_enrich(workers: int = 1) -> dict:
+def _run_enrich(workers: int = 1, headless: bool = True) -> dict:
     """Stage: Detail enrichment — scrape full descriptions and apply URLs."""
     try:
         from applypilot.enrichment.detail import run_enrichment
-        run_enrichment(workers=workers)
+        run_enrichment(workers=workers, headless=headless)
         return {"status": "ok"}
     except Exception as e:
         log.error("Enrichment failed: %s", e)
@@ -254,6 +255,9 @@ _STREAM_POLL_INTERVAL = 10
 
 def _count_pending(stage: str, min_score: int = 7) -> int:
     """Count pending work items for a stage."""
+    if stage == "pdf":
+        return count_pending_pdf()
+
     sql = _PENDING_SQL.get(stage)
     if sql is None:
         return 0
@@ -270,6 +274,7 @@ def _run_stage_streaming(
     min_score: int = 7,
     workers: int = 1,
     validation_mode: str = "normal",
+    headless: bool = True,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -284,6 +289,8 @@ def _run_stage_streaming(
         kwargs["validation_mode"] = validation_mode
     if stage in ("discover", "enrich"):
         kwargs["workers"] = workers
+    if stage == "enrich":
+        kwargs["headless"] = headless
 
     upstream = _UPSTREAM[stage]
 
@@ -334,7 +341,7 @@ def _run_stage_streaming(
 # ---------------------------------------------------------------------------
 
 def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
-                    validation_mode: str = "normal") -> dict:
+                    validation_mode: str = "normal", headless: bool = True) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
@@ -357,6 +364,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                 kwargs["validation_mode"] = validation_mode
             if name in ("discover", "enrich"):
                 kwargs["workers"] = workers
+            if name == "enrich":
+                kwargs["headless"] = headless
             result = runner(**kwargs)
             elapsed = time.time() - t0
 
@@ -386,6 +395,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                     "min_score": min_score,
                     "workers": workers,
                     "validation_mode": validation_mode,
+                    "llm_provider": os.environ.get("LLM_PROVIDER", "claude").lower(),
                 },
                 remaining_stages=remaining,
                 reason="usage_limit",
@@ -421,7 +431,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
 
 def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
-                   validation_mode: str = "normal") -> dict:
+                   validation_mode: str = "normal", headless: bool = True) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -439,7 +449,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
     def _streaming_wrapper(name: str) -> None:
         """Wrapper that catches UsageLimitError in streaming threads."""
         try:
-            _run_stage_streaming(name, tracker, stop_event, min_score, workers, validation_mode)
+            _run_stage_streaming(name, tracker, stop_event, min_score, workers, validation_mode, headless=headless)
         except UsageLimitError as ule:
             nonlocal usage_limit_info
             usage_limit_info = {
@@ -511,6 +521,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
                 "workers": workers,
                 "validation_mode": validation_mode,
                 "stream": True,
+                "llm_provider": os.environ.get("LLM_PROVIDER", "claude").lower(),
             },
             remaining_stages=ordered,
             reason="usage_limit",
@@ -529,6 +540,7 @@ def run_pipeline(
     stream: bool = False,
     workers: int = 1,
     validation_mode: str = "normal",
+    headless: bool = True,
 ) -> dict:
     """Run pipeline stages.
 
@@ -538,6 +550,7 @@ def run_pipeline(
         dry_run: If True, preview stages without executing.
         stream: If True, run stages concurrently (streaming mode).
         workers: Number of parallel threads for discovery/enrichment stages.
+        headless: If False, show the browser window during enrichment scraping.
 
     Returns:
         Dict with keys: stages (list of result dicts), errors (dict), elapsed (float).
@@ -588,10 +601,10 @@ def run_pipeline(
     # Execute
     if stream:
         result = _run_streaming(ordered, min_score, workers=workers,
-                                validation_mode=validation_mode)
+                                validation_mode=validation_mode, headless=headless)
     else:
         result = _run_sequential(ordered, min_score, workers=workers,
-                                 validation_mode=validation_mode)
+                                 validation_mode=validation_mode, headless=headless)
 
     # Summary table
     console.print(f"\n{'=' * 70}")

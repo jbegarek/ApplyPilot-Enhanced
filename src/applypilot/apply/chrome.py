@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from applypilot import config
@@ -23,6 +25,26 @@ BASE_CDP_PORT = 9222
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_lock = threading.Lock()
+
+
+def _is_cdp_ready(port: int, timeout: float = 1.5) -> bool:
+    """Return True if Chrome DevTools endpoint is reachable on the given port."""
+    url = f"http://127.0.0.1:{port}/json/version"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return False
+
+
+def _wait_for_cdp(port: int, max_wait_sec: float = 12.0) -> bool:
+    """Poll briefly for the Chrome DevTools endpoint to become available."""
+    deadline = time.time() + max_wait_sec
+    while time.time() < deadline:
+        if _is_cdp_ready(port):
+            return True
+        time.sleep(0.25)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -186,14 +208,19 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # Chrome launch / kill
 # ---------------------------------------------------------------------------
 
-def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False) -> subprocess.Popen:
+def launch_chrome(
+    worker_id: int,
+    port: int | None = None,
+    headless: bool = False,
+    use_real_profile: bool = False,
+) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
 
     Args:
         worker_id: Numeric worker identifier.
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
         headless: Run Chrome in headless mode (no visible window).
+        use_real_profile: Use the real Chrome user-data dir instead of a worker clone.
 
     Returns:
         subprocess.Popen handle for the Chrome process.
@@ -201,39 +228,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if port is None:
         port = BASE_CDP_PORT + worker_id
 
-    profile_dir = setup_worker_profile(worker_id)
-
-    # Kill any zombie Chrome from a previous run on this port
-    _kill_on_port(port)
-
-    # Patch preferences to suppress restore nag
-    _suppress_restore_nag(profile_dir)
-
     chrome_exe = config.get_chrome_path()
-
-    cmd = [
-        chrome_exe,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile_dir}",
-        "--profile-directory=Default",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--window-size=1024,768",
-        "--disable-session-crashed-bubble",
-        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
-        "--hide-crash-restore-bubble",
-        "--noerrdialogs",
-        "--password-store=basic",
-        "--disable-save-password-bubble",
-        "--disable-popup-blocking",
-        # Block dangerous permissions at browser level
-        "--use-fake-device-for-media-stream",
-        "--use-fake-ui-for-media-stream",
-        "--deny-permission-prompts",
-        "--disable-notifications",
-    ]
-    if headless:
-        cmd.append("--headless=new")
 
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -241,15 +236,87 @@ def launch_chrome(worker_id: int, port: int | None = None,
         import os
         kwargs["preexec_fn"] = os.setsid
 
-    proc = subprocess.Popen(cmd, **kwargs)
-    with _chrome_lock:
-        _chrome_procs[worker_id] = proc
+    def _start_with_profile(profile_dir: Path) -> subprocess.Popen | None:
+        # Kill any zombie Chrome from a previous run on this port
+        _kill_on_port(port)
 
-    # Give Chrome time to start and open the debug port
-    time.sleep(3)
-    logger.info("[worker-%d] Chrome started on port %d (pid %d)",
-                worker_id, port, proc.pid)
-    return proc
+        cmd = [
+            chrome_exe,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile_dir}",
+            "--profile-directory=Default",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--window-size=1024,768",
+            "--disable-session-crashed-bubble",
+            "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
+            "--hide-crash-restore-bubble",
+            "--noerrdialogs",
+            "--password-store=basic",
+            "--disable-save-password-bubble",
+            "--disable-popup-blocking",
+            # Block dangerous permissions at browser level
+            "--use-fake-device-for-media-stream",
+            "--deny-permission-prompts",
+            "--disable-notifications",
+        ]
+        if headless:
+            cmd.append("--headless=new")
+
+        proc = subprocess.Popen(cmd, **kwargs)
+        with _chrome_lock:
+            _chrome_procs[worker_id] = proc
+
+        if _wait_for_cdp(port):
+            logger.info(
+                "[worker-%d] Chrome started on port %d (pid %d, profile=%s)",
+                worker_id,
+                port,
+                proc.pid,
+                profile_dir,
+            )
+            return proc
+
+        logger.warning(
+            "[worker-%d] Chrome launched but CDP endpoint not reachable on port %d (profile=%s).",
+            worker_id,
+            port,
+            profile_dir,
+        )
+        if proc.poll() is None:
+            _kill_process_tree(proc.pid)
+        with _chrome_lock:
+            _chrome_procs.pop(worker_id, None)
+        return None
+
+    if use_real_profile:
+        real_profile = config.get_chrome_user_data()
+        if real_profile.exists():
+            proc = _start_with_profile(real_profile)
+            if proc is not None:
+                return proc
+            logger.warning(
+                "[worker-%d] Falling back to worker profile clone after live profile launch failed.",
+                worker_id,
+            )
+        else:
+            logger.warning(
+                "[worker-%d] Real Chrome profile not found at %s; falling back to worker profile clone.",
+                worker_id,
+                real_profile,
+            )
+
+    profile_dir = setup_worker_profile(worker_id)
+    _suppress_restore_nag(profile_dir)
+    proc = _start_with_profile(profile_dir)
+    if proc is not None:
+        return proc
+
+    if use_real_profile:
+        raise RuntimeError(
+            f"Chrome CDP unavailable on port {port}. Close all regular Chrome windows, then retry --live-chrome-profile."
+        )
+    raise RuntimeError(f"Chrome CDP unavailable on port {port}.")
 
 
 def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:

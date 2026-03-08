@@ -166,14 +166,27 @@ applypilot run --workers 4              # Parallel discovery/enrichment
 applypilot run --stream                 # Concurrent stages (streaming mode)
 applypilot run --min-score 8            # Override score threshold
 applypilot run --dry-run                # Preview without executing
+applypilot run enrich score tailor --show-browser
+                                        # Non-headless pipeline path into tailor (shows browser during enrich)
 applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
+applypilot run --reset-enrich-errors enrich
+                                        # Clear failed enrich attempts, then retry enrichment
+applypilot run score tailor cover --llm openai
+                                        # Override LLM provider for this run (claude/gemini/openai/codex)
+applypilot run --resume                 # Resume the last saved `run` session
 applypilot apply                        # Launch auto-apply
 applypilot apply --workers 3            # Parallel browser workers
 applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
+applypilot apply --mark-applied URL     # Utility mode: manually mark a job as applied
+applypilot apply --mark-failed URL --fail-reason "captcha"
+                                        # Utility mode: manually mark a job as failed with reason
+applypilot apply --reset-failed         # Utility mode: reset all failed jobs for retry
+applypilot apply --gen --url URL        # Utility mode: generate manual-debug prompt file
+applypilot resume                       # Resume the last saved session (run/apply)
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```
