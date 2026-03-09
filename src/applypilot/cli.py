@@ -216,6 +216,11 @@ def run(
     ),
     show_browser: bool = typer.Option(False, "--show-browser", help="Show browser window during enrichment (helps bypass bot detection)."),
     reset_enrich_errors: bool = typer.Option(False, "--reset-enrich-errors", help="Clear enrichment errors so failed jobs are retried."),
+    site_filter: Optional[list[str]] = typer.Option(
+        None,
+        "--site-filter",
+        help="Limit discovery to matching sites from sites.yaml (repeat flag for multiple).",
+    ),
     llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf.
@@ -260,6 +265,8 @@ def run(
                 validation = saved_args["validation_mode"]
             if llm is None and "llm_provider" in saved_args:
                 provider = _set_llm_provider_override(saved_args["llm_provider"])
+            if site_filter is None and "site_filter" in saved_args:
+                site_filter = saved_args["site_filter"]
 
             clear_session()
             console.print("[green]Session restored. Cleared saved state.[/green]\n")
@@ -309,6 +316,7 @@ def run(
         workers=workers,
         validation_mode=validation,
         headless=not show_browser,
+        site_filter=site_filter,
     )
 
     # Check if we stopped due to usage limit
@@ -318,6 +326,60 @@ def run(
 
     if result.get("errors"):
         raise typer.Exit(code=1)
+
+
+@app.command()
+def add_url(
+    url: str = typer.Argument(..., help="Job URL to insert or update."),
+    title: str = typer.Option("Manual Add", "--title", help="Job title."),
+    site: str = typer.Option("Manual", "--site", help="Source site label."),
+    location: Optional[str] = typer.Option(None, "--location", help="Job location."),
+    description: Optional[str] = typer.Option(None, "--description", help="Short description."),
+    application_url: Optional[str] = typer.Option(None, "--application-url", help="Direct apply URL (defaults to URL)."),
+    strategy: str = typer.Option("manual_url", "--strategy", help="Discovery strategy label."),
+) -> None:
+    """Insert or update a single job URL in the database."""
+    _bootstrap()
+
+    from datetime import datetime, timezone
+    from applypilot.database import get_connection
+
+    now = datetime.now(timezone.utc).isoformat()
+    apply_url = application_url or url
+    conn = get_connection()
+
+    exists = conn.execute("SELECT 1 FROM jobs WHERE url = ?", (url,)).fetchone() is not None
+
+    if exists:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET title = COALESCE(NULLIF(?, ''), title),
+                site = COALESCE(NULLIF(?, ''), site),
+                location = COALESCE(?, location),
+                description = COALESCE(?, description),
+                application_url = COALESCE(?, application_url),
+                strategy = COALESCE(NULLIF(?, ''), strategy),
+                discovered_at = COALESCE(discovered_at, ?)
+            WHERE url = ?
+            """,
+            (title, site, location, description, apply_url, strategy, now, url),
+        )
+        action = "Updated"
+    else:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                url, title, salary, description, location, site, strategy, discovered_at, application_url
+            ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+            """,
+            (url, title, description, location, site, strategy, now, apply_url),
+        )
+        action = "Added"
+
+    conn.commit()
+    console.print(f"[green]{action} job:[/green] {url}")
+    console.print(f"  Site: {site} | Title: {title}")
 
 
 @app.command()
@@ -334,12 +396,29 @@ def apply(
         "--live-chrome-profile",
         help="Use your real Chrome profile dir instead of isolated worker clones.",
     ),
+    chrome_profile_directory: Optional[str] = typer.Option(
+        None,
+        "--chrome-profile-directory",
+        help="Chrome profile dir name to launch (for example: 'Default' or 'Profile 1').",
+    ),
+    live_profile_fallback: bool = typer.Option(
+        False,
+        "--live-profile-fallback",
+        help="If live profile launch fails, retry with a worker-cloned profile.",
+    ),
+    close_all_chrome: bool = typer.Option(
+        False,
+        "--close-all-chrome",
+        help="Prompt to close all running Chrome processes before launching apply.",
+    ),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    remove_expired: bool = typer.Option(False, "--remove-expired", help="Remove expired jobs from the database."),
+    reset_in_progress: bool = typer.Option(False, "--reset-in-progress", help="Clear stale in-progress apply locks."),
 ) -> None:
     """Launch auto-apply to submit job applications.
 
@@ -347,11 +426,17 @@ def apply(
     - applypilot apply --mark-applied URL
     - applypilot apply --mark-failed URL --fail-reason "captcha"
     - applypilot apply --reset-failed
+    - applypilot apply --remove-expired
+    - applypilot apply --reset-in-progress
     - applypilot apply --gen --url URL
     """
     _bootstrap()
 
-    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
+    from applypilot.config import (
+        check_tier,
+        PROFILE_PATH as _profile_path,
+        get_chrome_profile_directory,
+    )
     from applypilot.database import get_connection
 
     # --- Utility modes (no Chrome/Claude needed) ---
@@ -372,6 +457,18 @@ def apply(
         from applypilot.apply.launcher import reset_failed as do_reset
         count = do_reset()
         console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
+        return
+
+    if remove_expired:
+        from applypilot.apply.launcher import remove_expired as do_remove
+        count = do_remove()
+        console.print(f"[green]Removed {count} expired job(s).[/green]")
+        return
+
+    if reset_in_progress:
+        from applypilot.apply.launcher import reset_in_progress as do_reset_in_progress
+        count = do_reset_in_progress()
+        console.print(f"[green]Reset {count} in-progress job(s).[/green]")
         return
 
     # --- Full apply mode ---
@@ -425,6 +522,7 @@ def apply(
     from applypilot.session import save_session, estimate_reset_time
 
     effective_limit = limit if limit is not None else (0 if continuous else 1)
+    effective_profile_directory = chrome_profile_directory or get_chrome_profile_directory()
 
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
@@ -432,10 +530,30 @@ def apply(
     console.print(f"  Model:    {model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Live profile: {live_chrome_profile}")
+    console.print(f"  Chrome profile dir: {effective_profile_directory}")
+    if live_chrome_profile:
+        console.print(f"  Live fallback: {live_profile_fallback}")
+    console.print(f"  Close Chrome first: {close_all_chrome}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
         console.print(f"  Target:   {url}")
     console.print()
+
+    if close_all_chrome:
+        from applypilot.apply.chrome import kill_system_chrome_processes
+        if typer.confirm("Close all running Chrome processes now?", default=False):
+            before_count, after_count = kill_system_chrome_processes()
+            closed = max(before_count - after_count, 0)
+            console.print(
+                f"[yellow]Chrome cleanup: before={before_count}, after={after_count}, closed~={closed}.[/yellow]"
+            )
+            if after_count > 0:
+                console.print(
+                    "[yellow]Some Chrome processes are still running. "
+                    "If live profile keeps failing, run as Administrator or use --live-profile-fallback.[/yellow]"
+                )
+        else:
+            console.print("[yellow]Skipped Chrome process cleanup.[/yellow]")
 
     try:
         apply_main(
@@ -448,7 +566,24 @@ def apply(
             continuous=continuous,
             workers=workers,
             use_real_profile=live_chrome_profile,
+            chrome_profile_directory=effective_profile_directory,
+            allow_real_profile_fallback=live_profile_fallback,
         )
+        if not dry_run:
+            from applypilot.apply.chrome import open_worker_profile_browser
+            try:
+                open_worker_profile_browser(
+                    worker_id=0,
+                    profile_directory=effective_profile_directory,
+                )
+                console.print(
+                    f"[cyan]Opened worker Chrome profile:[/cyan] "
+                    f"worker-0 / {effective_profile_directory}"
+                )
+            except Exception as exc:
+                console.print(
+                    f"[yellow]Could not auto-open worker Chrome profile:[/yellow] {exc}"
+                )
     except UsageLimitError as ule:
         reset_at = estimate_reset_time(ule.raw_message)
         save_session(
@@ -459,6 +594,9 @@ def apply(
                 "min_score": min_score,
                 "headless": headless,
                 "live_chrome_profile": live_chrome_profile,
+                "chrome_profile_directory": effective_profile_directory,
+                "live_profile_fallback": live_profile_fallback,
+                "close_all_chrome": close_all_chrome,
                 "model": model,
                 "dry_run": dry_run,
                 "continuous": continuous,
@@ -522,6 +660,7 @@ def resume(
             stream=saved_args.get("stream", False),
             workers=saved_args.get("workers", 1),
             validation_mode=saved_args.get("validation_mode", "normal"),
+            site_filter=saved_args.get("site_filter"),
         )
 
         if result.get("usage_limit"):
@@ -535,18 +674,42 @@ def resume(
         from applypilot.apply.launcher import main as apply_main
         from applypilot.llm import UsageLimitError
         from applypilot.session import save_session, estimate_reset_time
+        from applypilot.config import get_chrome_profile_directory
 
         apply_args = {
             "limit": saved_args.get("limit", 1),
             "target_url": saved_args.get("target_url"),
             "min_score": saved_args.get("min_score", 7),
             "headless": saved_args.get("headless", False),
-            "use_real_profile": saved_args.get("live_chrome_profile", False),
+            "use_real_profile": saved_args.get(
+                "live_chrome_profile", saved_args.get("use_real_profile", False)
+            ),
+            "chrome_profile_directory": saved_args.get(
+                "chrome_profile_directory", get_chrome_profile_directory()
+            ),
+            "allow_real_profile_fallback": saved_args.get("live_profile_fallback", False),
+            "close_all_chrome": saved_args.get("close_all_chrome", False),
             "model": saved_args.get("model", "haiku"),
             "dry_run": saved_args.get("dry_run", False),
             "continuous": saved_args.get("continuous", False),
             "workers": saved_args.get("workers", 1),
         }
+
+        if apply_args.pop("close_all_chrome", False):
+            from applypilot.apply.chrome import kill_system_chrome_processes
+            if typer.confirm("Close all running Chrome processes now?", default=False):
+                before_count, after_count = kill_system_chrome_processes()
+                closed = max(before_count - after_count, 0)
+                console.print(
+                    f"[yellow]Chrome cleanup: before={before_count}, after={after_count}, closed~={closed}.[/yellow]"
+                )
+                if after_count > 0:
+                    console.print(
+                        "[yellow]Some Chrome processes are still running. "
+                        "If live profile keeps failing, run as Administrator or use --live-profile-fallback.[/yellow]"
+                    )
+            else:
+                console.print("[yellow]Skipped Chrome process cleanup.[/yellow]")
 
         try:
             apply_main(**apply_args)

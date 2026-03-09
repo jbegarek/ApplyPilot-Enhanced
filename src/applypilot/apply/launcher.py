@@ -300,6 +300,46 @@ def reset_failed() -> int:
     return cursor.rowcount
 
 
+def remove_expired() -> int:
+    """Remove expired jobs from the database.
+
+    Expired jobs are identified by either:
+    - apply_status = 'expired'
+    - apply_error beginning with 'expired'
+
+    Returns:
+        Number of jobs removed.
+    """
+    conn = get_connection()
+    cursor = conn.execute(
+        """
+        DELETE FROM jobs
+        WHERE LOWER(COALESCE(apply_status, '')) = 'expired'
+           OR LOWER(COALESCE(apply_error, '')) LIKE 'expired%'
+        """
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
+def reset_in_progress() -> int:
+    """Clear stale in-progress apply locks.
+
+    Returns:
+        Number of rows unlocked.
+    """
+    conn = get_connection()
+    cursor = conn.execute(
+        """
+        UPDATE jobs
+        SET apply_status = NULL, agent_id = NULL
+        WHERE apply_status = 'in_progress'
+        """
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
 # ---------------------------------------------------------------------------
 # Per-job execution
 # ---------------------------------------------------------------------------
@@ -569,7 +609,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
                 model: str = "sonnet", dry_run: bool = False,
-                use_real_profile: bool = False) -> tuple[int, int]:
+                use_real_profile: bool = False,
+                chrome_profile_directory: str | None = None,
+                allow_real_profile_fallback: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -581,6 +623,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         model: Claude model name.
         dry_run: Don't click Submit.
         use_real_profile: Launch Chrome against the user's real profile dir.
+        chrome_profile_directory: Chrome profile dir name (e.g., "Default", "Profile 1").
+        allow_real_profile_fallback: If live profile launch fails, retry with worker clone.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -629,6 +673,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 port=port,
                 headless=headless,
                 use_real_profile=use_real_profile,
+                profile_directory=chrome_profile_directory,
+                allow_real_profile_fallback=allow_real_profile_fallback,
             )
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
@@ -833,7 +879,9 @@ def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
-         use_real_profile: bool = False) -> None:
+         use_real_profile: bool = False,
+         chrome_profile_directory: str | None = None,
+         allow_real_profile_fallback: bool = False) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -847,6 +895,8 @@ def main(limit: int = 1, target_url: str | None = None,
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
         use_real_profile: Launch Chrome against the user's real profile dir.
+        chrome_profile_directory: Chrome profile dir name (e.g., "Default", "Profile 1").
+        allow_real_profile_fallback: If live profile launch fails, retry with worker clone.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -919,6 +969,8 @@ def main(limit: int = 1, target_url: str | None = None,
                     model=model,
                     dry_run=dry_run,
                     use_real_profile=use_real_profile,
+                    chrome_profile_directory=chrome_profile_directory,
+                    allow_real_profile_fallback=allow_real_profile_fallback,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -943,6 +995,8 @@ def main(limit: int = 1, target_url: str | None = None,
                             model=model,
                             dry_run=dry_run,
                             use_real_profile=use_real_profile,
+                            chrome_profile_directory=chrome_profile_directory,
+                            allow_real_profile_fallback=allow_real_profile_fallback,
                         ): i
                         for i in range(workers)
                     }

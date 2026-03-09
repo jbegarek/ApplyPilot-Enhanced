@@ -10,7 +10,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import DB_PATH
+from applypilot.config import DB_PATH, DEFAULTS
 
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
@@ -350,7 +350,11 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "SELECT COUNT(*) FROM jobs "
         "WHERE tailored_resume_path IS NOT NULL "
         "AND applied_at IS NULL "
-        "AND application_url IS NOT NULL"
+        "AND application_url IS NOT NULL "
+        "AND (apply_status IS NULL OR apply_status = 'failed') "
+        "AND COALESCE(apply_attempts, 0) < ? "
+        "AND COALESCE(fit_score, 0) >= ?",
+        (DEFAULTS["max_apply_attempts"], DEFAULTS["min_score"]),
     ).fetchone()[0]
 
     # Additional pending counts to make stage backlog explicit
@@ -450,7 +454,10 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "tailored": "tailored_resume_path IS NOT NULL",
         "pending_apply": (
             "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
-            "AND application_url IS NOT NULL"
+            "AND application_url IS NOT NULL "
+            "AND (apply_status IS NULL OR apply_status = 'failed') "
+            "AND COALESCE(apply_attempts, 0) < ? "
+            "AND COALESCE(fit_score, 0) >= ?"
         ),
         "applied": "applied_at IS NOT NULL",
     }
@@ -459,9 +466,15 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     params: list = []
 
     if "?" in where and min_score is not None:
-        params.append(min_score)
+        if stage == "pending_apply":
+            params.extend([DEFAULTS["max_apply_attempts"], min_score])
+        else:
+            params.append(min_score)
     elif "?" in where:
-        params.append(7)  # default min_score
+        if stage == "pending_apply":
+            params.extend([DEFAULTS["max_apply_attempts"], DEFAULTS["min_score"]])
+        else:
+            params.append(7)  # default min_score
 
     if min_score is not None and "fit_score" not in where and stage in ("scored", "tailored", "applied"):
         where += " AND fit_score >= ?"
