@@ -1,13 +1,17 @@
 <!-- logo here -->
 
-# ApplyPilot
+# ApplyPilot Enhanced
+
+Fork of the original [ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot), kept compatible with the existing `applypilot` package, CLI, and `applypilot init` setup flow.
+
+> This fork stays general-purpose. It does not hardcode one job level or one persona. Users still configure their own search targets, filters, resume facts, and preferences through `applypilot init` and their generated config files.
 
 **Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**
 
 [![PyPI version](https://img.shields.io/pypi/v/applypilot?color=blue)](https://pypi.org/project/applypilot/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/Pickle-Pixel/ApplyPilot?style=social)](https://github.com/Pickle-Pixel/ApplyPilot)
+[![GitHub stars](https://img.shields.io/github/stars/jbegarek/ApplyPilot-Enhanced?style=social)](https://github.com/jbegarek/ApplyPilot-Enhanced)
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6S01UL5IO)
 
 
@@ -15,6 +19,29 @@
 
 https://github.com/user-attachments/assets/7ee3417f-43d4-4245-9952-35df1e77f2df
 
+
+---
+
+## Fork Notes
+
+This repository is a maintained fork intended to keep upstream compatibility while adding practical fixes and workflow improvements. The Python package name and console command remain `applypilot` for compatibility, but the documentation and metadata identify this repo as `ApplyPilot Enhanced`.
+
+Replace the placeholder fork metadata in `pyproject.toml` with your actual GitHub fork URLs before publishing.
+
+## Changes From Upstream
+
+This fork currently includes:
+
+- Smarter Lensa discovery using Lensa's current search route instead of the stale `/jobs?k=...&l=...` pattern.
+- Lensa API pagination support so discovery can fetch more than the first 20 results per search.
+- Tighter Lensa filtering for remote relevance, salary thresholding, and stronger title matching.
+- Exceptions that keep low-salary part-time, gig, contract, fractional, and executive consulting roles when appropriate.
+- Better per-site smart-extract resilience so one timed-out site does not abort the whole discovery batch.
+- Safer Playwright collection behavior with bounded page-load/idle waits and non-fatal headful fallback.
+- Gemini CLI fixes for Windows and large prompts by sending prompt text over `stdin` instead of command-line args.
+- Updated Gemini tailoring default model from the stale `gemini-1.5-pro` to `gemini-2.5-pro`.
+- Cleaner Gemini error reporting so actionable failures surface instead of noisy repo-scan warnings.
+- Additional tests covering Lensa target generation, pagination, filtering, smart-extract resilience, and Gemini CLI behavior.
 
 ---
 
@@ -151,6 +178,8 @@ The Playwright MCP server is configured automatically at runtime per worker. No 
 applypilot apply --mark-applied URL    # manually mark a job as applied
 applypilot apply --mark-failed URL     # manually mark a job as failed
 applypilot apply --reset-failed        # reset all failed jobs for retry
+applypilot apply --remove-expired      # delete expired jobs from the database
+applypilot apply --reset-in-progress   # clear stale in-progress locks
 applypilot apply --gen --url URL       # generate prompt file for manual debugging
 ```
 
@@ -180,16 +209,36 @@ applypilot apply --workers 3            # Parallel browser workers
 applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
+applypilot apply --live-chrome-profile --chrome-profile-directory "Profile 1"
+                                        # Reuse your signed-in Chrome profile
+applypilot apply --live-chrome-profile --live-profile-fallback
+                                        # If live profile fails, fallback to worker clone
+applypilot apply --close-all-chrome     # Prompt, then close running Chrome before apply
 applypilot apply --url URL              # Apply to a specific job
 applypilot apply --mark-applied URL     # Utility mode: manually mark a job as applied
 applypilot apply --mark-failed URL --fail-reason "captcha"
                                         # Utility mode: manually mark a job as failed with reason
 applypilot apply --reset-failed         # Utility mode: reset all failed jobs for retry
+applypilot apply --remove-expired       # Utility mode: delete expired jobs from DB
+applypilot apply --reset-in-progress    # Utility mode: clear stale in-progress locks
 applypilot apply --gen --url URL        # Utility mode: generate manual-debug prompt file
 applypilot resume                       # Resume the last saved session (run/apply)
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```
+
+---
+
+## Privacy And Publishing
+
+Do not publish or commit any of the following:
+
+- `~/.applypilot/` contents such as `profile.json`, `searches.yaml`, `resume.txt`, `resume.pdf`, `applypilot.db`, tailored resumes, cover letters, and session state
+- `.env` files containing API keys or provider settings
+- browser profile data, Chrome worker state, or machine-specific MCP configs
+- generated prompt files, logs, screenshots, or debug artifacts that may contain personal resume data, job history, or secrets
+
+This repository should only contain code, tests, templates, and scrubbed documentation. Keep all personal search criteria, compensation preferences, authorization answers, and API credentials out of version control.
 
 ---
 

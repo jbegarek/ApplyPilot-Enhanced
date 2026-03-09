@@ -46,7 +46,7 @@ def test_codex_cli_client_uses_codex_exec(monkeypatch: pytest.MonkeyPatch) -> No
     assert "hello" not in cmd
 
 
-def test_gemini_cli_client_uses_prompt_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gemini_cli_client_uses_stdin_for_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
     gemini_path = "C:/bin/gemini.CMD"
 
@@ -62,13 +62,14 @@ def test_gemini_cli_client_uses_prompt_flag(monkeypatch: pytest.MonkeyPatch) -> 
     out = client.chat([{"role": "user", "content": "hello"}])
 
     assert out == "gemini reply"
-    assert captured["input"] is None
+    assert captured["input"] == "hello"
     cmd = captured["cmd"]
     assert isinstance(cmd, list)
     assert cmd[0] == gemini_path
-    assert "--prompt" in cmd
+    assert "--prompt" not in cmd
     assert "--model" in cmd
     assert "gemini-2.0-flash" in cmd
+    assert "hello" not in cmd
 
 
 def test_make_client_prefers_gemini_cli(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -122,9 +123,31 @@ def test_model_resolution_treats_auto_override_as_provider_default(
 
     with caplog.at_level("WARNING"):
         assert llm._model("general") == "gemini-2.0-flash"
-        assert llm._model("tailor") == "gemini-1.5-pro"
+        assert llm._model("tailor") == "gemini-2.5-pro"
 
     assert "Ignoring LLM_MODEL='auto'" not in caplog.text
+
+
+def test_gemini_cli_client_surfaces_actionable_error_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    gemini_path = "C:/bin/gemini.CMD"
+
+    def fake_run(*args, **kwargs):
+        return _FakeResult(
+            returncode=1,
+            stderr=(
+                "[WARN] Skipping unreadable directory: x\n"
+                "Loaded cached credentials.\n"
+                "ModelNotFoundError: Requested entity was not found.\n"
+            ),
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(llm.shutil, "which", lambda name: gemini_path if name == "gemini" else None)
+    monkeypatch.setattr(llm, "_MAX_RETRIES", 1)
+
+    client = llm.GeminiCLIClient(model="gemini-1.5-pro")
+    with pytest.raises(RuntimeError, match="ModelNotFoundError: Requested entity was not found."):
+        client.chat([{"role": "user", "content": "hello"}])
 
 
 def test_codex_cli_client_uses_tail_error_line(monkeypatch: pytest.MonkeyPatch) -> None:

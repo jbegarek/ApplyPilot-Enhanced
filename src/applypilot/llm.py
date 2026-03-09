@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 _PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "claude": {"general": "sonnet",           "tailor": "claude-opus-4-6"},
-    "gemini": {"general": "gemini-2.0-flash", "tailor": "gemini-1.5-pro"},
+    "gemini": {"general": "gemini-2.0-flash", "tailor": "gemini-2.5-pro"},
     "openai": {"general": "gpt-4o-mini",      "tailor": "gpt-4o"},
     "codex":  {"general": "auto",             "tailor": "auto"},
 }
@@ -276,7 +276,7 @@ class ClaudeCLIClient:
 # ---------------------------------------------------------------------------
 
 class GeminiCLIClient:
-    """LLM client via Gemini CLI (`gemini --prompt`)."""
+    """LLM client via Gemini CLI in headless mode with stdin-fed prompts."""
 
     def __init__(self, model: str = "gemini-2.0-flash") -> None:
         self.model = model
@@ -292,8 +292,8 @@ class GeminiCLIClient:
         prompt = _collapse_messages_for_single_prompt(messages)
         cmd = [
             self.executable,
-            "--prompt",
-            prompt,
+            "-p",
+            "",
             "--model",
             self.model,
             "--output-format",
@@ -304,6 +304,7 @@ class GeminiCLIClient:
             try:
                 result = subprocess.run(
                     cmd,
+                    input=prompt,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
@@ -312,7 +313,7 @@ class GeminiCLIClient:
                 )
 
                 if result.returncode != 0:
-                    error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                    error_msg = _summarize_cli_error(result.stderr, result.stdout)
                     if _is_usage_limit_error(error_msg):
                         raise UsageLimitError(
                             f"Gemini CLI usage limit: {error_msg[:300]}",
