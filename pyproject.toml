@@ -26,6 +26,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "pandas>=2.0",
+    "openpyxl>=3.1",
     ]
 
 [project.optional-dependencies]
@@ -52,3 +53,6 @@ artifacts = ["src/applypilot/config/*.yaml"]
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+
+[tool.pytest.ini_options]
+norecursedirs = ["applypilot-test-*", "pytest-cache-*"]

@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -26,8 +27,19 @@ app = typer.Typer(
     help="AI-powered end-to-end job application pipeline.",
     no_args_is_help=True,
 )
+pipeline_app = typer.Typer(help="Run the full pipeline or selected stages.")
+reset_app = typer.Typer(help="Reset pipeline or apply state.")
+remove_app = typer.Typer(help="Remove records from the database.")
+mark_app = typer.Typer(help="Manually mark apply outcomes.")
+export_app = typer.Typer(help="Export job data for manual workflows.")
 console = Console()
 log = logging.getLogger(__name__)
+
+app.add_typer(pipeline_app, name="pipeline")
+app.add_typer(reset_app, name="reset")
+app.add_typer(remove_app, name="remove")
+app.add_typer(mark_app, name="mark")
+app.add_typer(export_app, name="export")
 
 # Valid pipeline stages (in execution order)
 VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
@@ -165,6 +177,368 @@ def _ensure_llm_provider_ready(provider: str) -> None:
         raise typer.Exit(code=1)
 
 
+def _set_llm_model_override(llm_model: str | None) -> str | None:
+    """Set a model override for the active provider and return the value."""
+    if llm_model:
+        os.environ["LLM_MODEL"] = llm_model
+        return llm_model
+    return os.environ.get("LLM_MODEL")
+
+
+def _resolve_llm_model_option(
+    llm_model: str | None,
+    model_alias: str | None = None,
+    *,
+    default: str | None = None,
+) -> str | None:
+    """Resolve canonical and deprecated model flags."""
+    resolved = llm_model
+    if model_alias:
+        if llm_model:
+            console.print("[yellow]Both --llm-model and deprecated --model were provided; using --llm-model.[/yellow]")
+        else:
+            console.print("[yellow]--model is deprecated; use --llm-model instead.[/yellow]")
+            resolved = model_alias
+    if resolved:
+        return resolved
+    return default
+
+
+def _ensure_apply_provider_supported(provider: str) -> None:
+    """Auto-apply currently depends on the Claude CLI + MCP workflow."""
+    if provider != "claude":
+        console.print(
+            "[red]Auto-apply currently supports only the Claude provider.[/red] "
+            "Use `applypilot score/tailor/cover` or `applypilot pipeline` for Gemini, OpenAI, or Codex."
+        )
+        raise typer.Exit(code=1)
+
+
+def _validate_stage_names(stage_list: list[str]) -> None:
+    for stage in stage_list:
+        if stage != "all" and stage not in VALID_STAGES:
+            console.print(
+                f"[red]Unknown stage:[/red] '{stage}'. "
+                f"Valid stages: {', '.join(VALID_STAGES)}, all"
+            )
+            raise typer.Exit(code=1)
+
+
+def _run_pipeline_command(
+    *,
+    stages: Optional[list[str]],
+    min_score: int,
+    workers: int,
+    stream: bool,
+    dry_run: bool,
+    resume: bool,
+    validation: str,
+    show_browser: bool,
+    reset_enrich_errors: bool,
+    remove_enrich_errors: bool,
+    site_filter: Optional[list[str]],
+    llm: str | None,
+    llm_model: str | None,
+) -> None:
+    provider = _set_llm_provider_override(llm)
+    _set_llm_model_override(llm_model)
+
+    _bootstrap()
+
+    from applypilot.pipeline import run_pipeline
+    from applypilot.session import load_session, clear_session
+
+    if resume:
+        session = load_session()
+        if session is None:
+            console.print("[yellow]No saved session found. Starting a normal run.[/yellow]")
+        elif session.get("command") != "run":
+            console.print(
+                f"[yellow]Saved session is for '{session.get('command')}', not 'run'. "
+                f"Ignoring and starting a normal run.[/yellow]"
+            )
+        else:
+            saved_args = session.get("args", {})
+            remaining = session.get("remaining_stages")
+
+            if stages is None and remaining:
+                stages = remaining
+                console.print(f"[cyan]Resuming from saved session - stages: {', '.join(remaining)}[/cyan]")
+            if min_score == 7 and "min_score" in saved_args:
+                min_score = saved_args["min_score"]
+            if workers == 1 and "workers" in saved_args:
+                workers = saved_args["workers"]
+            if not stream and saved_args.get("stream"):
+                stream = True
+            if validation == "normal" and "validation_mode" in saved_args:
+                validation = saved_args["validation_mode"]
+            if llm is None and "llm_provider" in saved_args:
+                provider = _set_llm_provider_override(saved_args["llm_provider"])
+            if llm_model is None:
+                saved_llm_model = saved_args.get("llm_model") or saved_args.get("model")
+                _set_llm_model_override(saved_llm_model)
+            if site_filter is None and "site_filter" in saved_args:
+                site_filter = saved_args["site_filter"]
+
+            clear_session()
+            console.print("[green]Session restored. Cleared saved state.[/green]\n")
+
+    stage_list = stages if stages else ["all"]
+
+    if remove_enrich_errors:
+        from applypilot.database import get_connection
+        conn = get_connection()
+        result_del = conn.execute(
+            "DELETE FROM jobs WHERE detail_error IS NOT NULL"
+        )
+        conn.commit()
+        conn.close()
+        console.print(f"[red]Removed {result_del.rowcount} job(s) with enrichment errors.[/red]")
+
+    if reset_enrich_errors:
+        from applypilot.database import get_connection
+        conn = get_connection()
+        result_reset = conn.execute(
+            "UPDATE jobs SET detail_scraped_at = NULL, detail_error = NULL "
+            "WHERE detail_error IS NOT NULL"
+        )
+        conn.commit()
+        conn.close()
+        console.print(f"[cyan]Reset {result_reset.rowcount} enrichment error job(s) for retry.[/cyan]")
+
+    _validate_stage_names(stage_list)
+
+    llm_stages = {"score", "tailor", "cover"}
+    if any(stage in stage_list for stage in llm_stages) or "all" in stage_list:
+        _ensure_llm_provider_ready(provider)
+
+    valid_modes = ("strict", "normal", "lenient")
+    if validation not in valid_modes:
+        console.print(
+            f"[red]Invalid --validation value:[/red] '{validation}'. "
+            f"Choose from: {', '.join(valid_modes)}"
+        )
+        raise typer.Exit(code=1)
+
+    result = run_pipeline(
+        stages=stage_list,
+        min_score=min_score,
+        dry_run=dry_run,
+        stream=stream,
+        workers=workers,
+        validation_mode=validation,
+        headless=not show_browser,
+        site_filter=site_filter,
+    )
+
+    if result.get("usage_limit"):
+        _show_usage_limit_exit(result.get("reset_at"))
+        raise typer.Exit(code=2)
+
+    if result.get("errors"):
+        raise typer.Exit(code=1)
+
+
+def _mark_applied(url: str) -> None:
+    from applypilot.apply.launcher import mark_job
+
+    _bootstrap()
+    mark_job(url, "applied")
+    console.print(f"[green]Marked as applied:[/green] {url}")
+
+
+def _mark_failed(url: str, reason: str | None) -> None:
+    from applypilot.apply.launcher import mark_job
+
+    _bootstrap()
+    mark_job(url, "failed", reason=reason)
+    console.print(f"[yellow]Marked as failed:[/yellow] {url} ({reason or 'manual'})")
+
+
+def _reset_failed_jobs() -> None:
+    from applypilot.apply.launcher import reset_failed as do_reset
+
+    _bootstrap()
+    count = do_reset()
+    console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
+
+
+def _remove_expired_jobs() -> None:
+    from applypilot.apply.launcher import remove_expired as do_remove
+
+    _bootstrap()
+    count = do_remove()
+    console.print(f"[green]Removed {count} expired job(s).[/green]")
+
+
+def _reset_in_progress_jobs() -> None:
+    from applypilot.apply.launcher import reset_in_progress as do_reset_in_progress
+
+    _bootstrap()
+    count = do_reset_in_progress()
+    console.print(f"[green]Reset {count} in-progress job(s).[/green]")
+
+
+def _export_ready_jobs(
+    *,
+    output: Path | None,
+    min_score: int | None,
+    include_failed: bool,
+) -> None:
+    from applypilot.export import (
+        build_default_ready_jobs_export_path,
+        export_ready_jobs_to_xlsx,
+        fetch_ready_jobs_for_export,
+    )
+
+    resolved_output = output or build_default_ready_jobs_export_path()
+    rows = fetch_ready_jobs_for_export(min_score=min_score, include_failed=include_failed)
+    written_path = export_ready_jobs_to_xlsx(rows=rows, output=resolved_output)
+    console.print(f"[green]Exported {len(rows)} ready job(s) to:[/green] {written_path}")
+
+
+def _ensure_apply_ready(*, gen: bool, url: str | None) -> None:
+    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
+    from applypilot.database import get_connection
+
+    check_tier(3, "auto-apply")
+
+    if not _profile_path.exists():
+        console.print(
+            "[red]Profile not found.[/red]\n"
+            "Run [bold]applypilot init[/bold] to create your profile first."
+        )
+        raise typer.Exit(code=1)
+
+    if not (gen and url):
+        conn = get_connection()
+        ready = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
+        ).fetchone()[0]
+        if ready == 0:
+            console.print(
+                "[red]No tailored resumes ready.[/red]\n"
+                "Run [bold]applypilot pipeline run score tailor[/bold] first to prepare applications."
+            )
+            raise typer.Exit(code=1)
+
+
+def _post_apply_success(*, dry_run: bool, profile_directory: str) -> None:
+    if dry_run:
+        return
+
+    from applypilot.apply.chrome import open_worker_profile_browser
+
+    try:
+        open_worker_profile_browser(
+            worker_id=0,
+            profile_directory=profile_directory,
+        )
+        console.print(
+            f"[cyan]Opened worker Chrome profile:[/cyan] "
+            f"worker-0 / {profile_directory}"
+        )
+    except Exception as exc:
+        console.print(
+            f"[yellow]Could not auto-open worker Chrome profile:[/yellow] {exc}"
+        )
+
+
+def _print_help(topic: str | None = None) -> None:
+    root_help = """ApplyPilot commands
+
+Top-level commands:
+  applypilot init
+  applypilot pipeline
+  applypilot pipeline run discover score
+  applypilot discover
+  applypilot enrich
+  applypilot score
+  applypilot tailor
+  applypilot cover
+  applypilot pdf
+  applypilot apply
+  applypilot add-url URL --title TITLE
+  applypilot export ready-jobs
+  applypilot resume
+  applypilot reset failed
+  applypilot reset in-progress
+  applypilot remove expired
+  applypilot mark applied --url URL
+  applypilot mark failed --url URL --reason captcha
+  applypilot status
+  applypilot dashboard
+  applypilot doctor
+  applypilot help <topic>
+
+Use `applypilot help <topic>` for focused help. `--help` still works.
+"""
+    topic_help = {
+        "pipeline": """Pipeline commands
+
+  applypilot pipeline
+    Run all pipeline stages.
+
+  applypilot pipeline run discover score
+    Run only specific stages.
+
+  Current flags:
+    --workers
+    --stream
+    --dry-run
+    --resume
+    --validation
+    --show-browser
+    --reset-enrich-errors
+    --remove-enrich-errors
+    --site-filter
+    --llm
+    --llm-model
+
+  Legacy compatibility:
+    applypilot run discover score
+""",
+        "apply": """Apply command
+
+  applypilot apply --llm claude --llm-model haiku
+  applypilot apply --url URL --dry-run
+  applypilot apply --workers 3 --continuous
+  applypilot apply --headless --close-all-chrome
+  applypilot apply --live-chrome-profile --chrome-profile-directory "Profile 1"
+  applypilot apply --live-profile-fallback
+
+  Deprecated compatibility:
+    --model maps to --llm-model
+""",
+        "reset": """Reset commands
+
+  applypilot reset failed
+  applypilot reset in-progress
+""",
+        "remove": """Remove commands
+
+  applypilot remove expired
+""",
+        "mark": """Mark commands
+
+  applypilot mark applied --url URL
+  applypilot mark failed --url URL --reason captcha
+""",
+        "export": """Export commands
+
+  applypilot export ready-jobs
+    Write an .xlsx workbook for manual applications.
+
+  applypilot export ready-jobs --output PATH
+    Write the workbook to a specific path.
+
+  applypilot export ready-jobs --include-failed
+    Include failed-but-ready jobs in the export.
+""",
+    }
+    console.print(topic_help.get(topic or "", root_help))
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -187,6 +561,160 @@ def init() -> None:
     from applypilot.wizard.init import run_wizard
 
     run_wizard()
+
+
+@pipeline_app.callback(invoke_without_command=True)
+def pipeline(
+    ctx: typer.Context,
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
+    stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
+    resume: bool = typer.Option(False, "--resume", "-r", help="Resume from last saved session."),
+    validation: str = typer.Option("normal", "--validation", help="Validation strictness for tailor/cover stages."),
+    show_browser: bool = typer.Option(False, "--show-browser", help="Show browser window during enrichment."),
+    reset_enrich_errors: bool = typer.Option(False, "--reset-enrich-errors", help="Clear enrichment errors so failed jobs are retried."),
+    remove_enrich_errors: bool = typer.Option(False, "--remove-enrich-errors", help="Delete jobs that failed enrichment."),
+    site_filter: Optional[list[str]] = typer.Option(None, "--site-filter", help="Limit discovery to matching sites from sites.yaml."),
+    llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
+    llm_model: str = typer.Option(None, "--llm-model", help="Override the general-tier model."),
+) -> None:
+    """Run the full pipeline."""
+    if ctx.invoked_subcommand is not None:
+        return
+    _run_pipeline_command(
+        stages=None,
+        min_score=min_score,
+        workers=workers,
+        stream=stream,
+        dry_run=dry_run,
+        resume=resume,
+        validation=validation,
+        show_browser=show_browser,
+        reset_enrich_errors=reset_enrich_errors,
+        remove_enrich_errors=remove_enrich_errors,
+        site_filter=site_filter,
+        llm=llm,
+        llm_model=llm_model,
+    )
+
+
+@pipeline_app.command("run")
+def pipeline_run(
+    stages: Optional[list[str]] = typer.Argument(None, help=f"Pipeline stages to run: {', '.join(VALID_STAGES)}, all."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
+    stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
+    resume: bool = typer.Option(False, "--resume", "-r", help="Resume from last saved session."),
+    validation: str = typer.Option("normal", "--validation", help="Validation strictness for tailor/cover stages."),
+    show_browser: bool = typer.Option(False, "--show-browser", help="Show browser window during enrichment."),
+    reset_enrich_errors: bool = typer.Option(False, "--reset-enrich-errors", help="Clear enrichment errors so failed jobs are retried."),
+    remove_enrich_errors: bool = typer.Option(False, "--remove-enrich-errors", help="Delete jobs that failed enrichment."),
+    site_filter: Optional[list[str]] = typer.Option(None, "--site-filter", help="Limit discovery to matching sites from sites.yaml."),
+    llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
+    llm_model: str = typer.Option(None, "--llm-model", help="Override the general-tier model."),
+) -> None:
+    """Run selected pipeline stages."""
+    _run_pipeline_command(
+        stages=stages,
+        min_score=min_score,
+        workers=workers,
+        stream=stream,
+        dry_run=dry_run,
+        resume=resume,
+        validation=validation,
+        show_browser=show_browser,
+        reset_enrich_errors=reset_enrich_errors,
+        remove_enrich_errors=remove_enrich_errors,
+        site_filter=site_filter,
+        llm=llm,
+        llm_model=llm_model,
+    )
+
+
+def _stage_command(stage: str, *, dry_run: bool, min_score: int, workers: int, stream: bool, validation: str, show_browser: bool, site_filter: Optional[list[str]], llm: str | None, llm_model: str | None) -> None:
+    _run_pipeline_command(
+        stages=[stage],
+        min_score=min_score,
+        workers=workers,
+        stream=stream,
+        dry_run=dry_run,
+        resume=False,
+        validation=validation,
+        show_browser=show_browser,
+        reset_enrich_errors=False,
+        remove_enrich_errors=False,
+        site_filter=site_filter,
+        llm=llm,
+        llm_model=llm_model,
+    )
+
+
+@app.command("discover")
+def discover_command(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview stage without executing."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads."),
+    stream: bool = typer.Option(False, "--stream", help="Run stages concurrently."),
+    show_browser: bool = typer.Option(False, "--show-browser", help="Show browser window during enrichment."),
+    site_filter: Optional[list[str]] = typer.Option(None, "--site-filter", help="Limit discovery to matching sites."),
+) -> None:
+    """Run discovery."""
+    _stage_command("discover", dry_run=dry_run, min_score=7, workers=workers, stream=stream, validation="normal", show_browser=show_browser, site_filter=site_filter, llm=None, llm_model=None)
+
+
+@app.command("enrich")
+def enrich_command(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview stage without executing."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads."),
+    stream: bool = typer.Option(False, "--stream", help="Run stages concurrently."),
+    show_browser: bool = typer.Option(False, "--show-browser", help="Show browser window during enrichment."),
+) -> None:
+    """Run enrichment."""
+    _stage_command("enrich", dry_run=dry_run, min_score=7, workers=workers, stream=stream, validation="normal", show_browser=show_browser, site_filter=None, llm=None, llm_model=None)
+
+
+@app.command("score")
+def score_command(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview stage without executing."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score threshold."),
+    llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
+    llm_model: str = typer.Option(None, "--llm-model", help="Override the general-tier model."),
+) -> None:
+    """Run scoring."""
+    _stage_command("score", dry_run=dry_run, min_score=min_score, workers=1, stream=False, validation="normal", show_browser=False, site_filter=None, llm=llm, llm_model=llm_model)
+
+
+@app.command("tailor")
+def tailor_command(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview stage without executing."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score threshold."),
+    validation: str = typer.Option("normal", "--validation", help="Validation strictness for tailoring."),
+    llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
+    llm_model: str = typer.Option(None, "--llm-model", help="Override the general-tier model."),
+) -> None:
+    """Run tailoring."""
+    _stage_command("tailor", dry_run=dry_run, min_score=min_score, workers=1, stream=False, validation=validation, show_browser=False, site_filter=None, llm=llm, llm_model=llm_model)
+
+
+@app.command("cover")
+def cover_command(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview stage without executing."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score threshold."),
+    validation: str = typer.Option("normal", "--validation", help="Validation strictness for cover generation."),
+    llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
+    llm_model: str = typer.Option(None, "--llm-model", help="Override the general-tier model."),
+) -> None:
+    """Run cover-letter generation."""
+    _stage_command("cover", dry_run=dry_run, min_score=min_score, workers=1, stream=False, validation=validation, show_browser=False, site_filter=None, llm=llm, llm_model=llm_model)
+
+
+@app.command("pdf")
+def pdf_command(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview stage without executing."),
+) -> None:
+    """Run PDF conversion."""
+    _stage_command("pdf", dry_run=dry_run, min_score=7, workers=1, stream=False, validation="normal", show_browser=False, site_filter=None, llm=None, llm_model=None)
 
 
 @app.command()
@@ -216,116 +744,31 @@ def run(
     ),
     show_browser: bool = typer.Option(False, "--show-browser", help="Show browser window during enrichment (helps bypass bot detection)."),
     reset_enrich_errors: bool = typer.Option(False, "--reset-enrich-errors", help="Clear enrichment errors so failed jobs are retried."),
+    remove_enrich_errors: bool = typer.Option(False, "--remove-enrich-errors", help="Delete jobs that failed enrichment (dead postings)."),
     site_filter: Optional[list[str]] = typer.Option(
         None,
         "--site-filter",
         help="Limit discovery to matching sites from sites.yaml (repeat flag for multiple).",
     ),
     llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
+    llm_model: str = typer.Option(None, "--llm-model", help="Override the general-tier model (e.g. gemini-2.5-flash, gemini-2.5-flash-lite)."),
 ) -> None:
-    """Run pipeline stages: discover, enrich, score, tailor, cover, pdf.
-
-    Examples:
-    - applypilot run enrich score tailor --show-browser
-    - applypilot run --reset-enrich-errors enrich
-    - applypilot run score tailor cover --llm openai
-    """
-    provider = _set_llm_provider_override(llm)
-
-    _bootstrap()
-
-    from applypilot.pipeline import run_pipeline
-    from applypilot.session import load_session, clear_session
-
-    # Handle --resume: override arguments from saved session
-    if resume:
-        session = load_session()
-        if session is None:
-            console.print("[yellow]No saved session found. Starting a normal run.[/yellow]")
-        elif session.get("command") != "run":
-            console.print(
-                f"[yellow]Saved session is for '{session.get('command')}', not 'run'. "
-                f"Ignoring and starting a normal run.[/yellow]"
-            )
-        else:
-            saved_args = session.get("args", {})
-            remaining = session.get("remaining_stages")
-
-            # Restore saved arguments (CLI flags override saved values)
-            if stages is None and remaining:
-                stages = remaining
-                console.print(f"[cyan]Resuming from saved session — stages: {', '.join(remaining)}[/cyan]")
-            if min_score == 7 and "min_score" in saved_args:
-                min_score = saved_args["min_score"]
-            if workers == 1 and "workers" in saved_args:
-                workers = saved_args["workers"]
-            if not stream and saved_args.get("stream"):
-                stream = True
-            if validation == "normal" and "validation_mode" in saved_args:
-                validation = saved_args["validation_mode"]
-            if llm is None and "llm_provider" in saved_args:
-                provider = _set_llm_provider_override(saved_args["llm_provider"])
-            if site_filter is None and "site_filter" in saved_args:
-                site_filter = saved_args["site_filter"]
-
-            clear_session()
-            console.print("[green]Session restored. Cleared saved state.[/green]\n")
-
-    stage_list = stages if stages else ["all"]
-
-    # Reset enrichment errors if requested
-    if reset_enrich_errors:
-        from applypilot.database import get_connection
-        conn = get_connection()
-        result_reset = conn.execute(
-            "UPDATE jobs SET detail_scraped_at = NULL, detail_error = NULL "
-            "WHERE detail_error IS NOT NULL"
-        )
-        conn.commit()
-        conn.close()
-        console.print(f"[cyan]Reset {result_reset.rowcount} enrichment error job(s) for retry.[/cyan]")
-
-    # Validate stage names
-    for s in stage_list:
-        if s != "all" and s not in VALID_STAGES:
-            console.print(
-                f"[red]Unknown stage:[/red] '{s}'. "
-                f"Valid stages: {', '.join(VALID_STAGES)}, all"
-            )
-            raise typer.Exit(code=1)
-
-    # Gate AI stages behind Tier 2
-    llm_stages = {"score", "tailor", "cover"}
-    if any(s in stage_list for s in llm_stages) or "all" in stage_list:
-        _ensure_llm_provider_ready(provider)
-
-    # Validate the --validation flag value
-    valid_modes = ("strict", "normal", "lenient")
-    if validation not in valid_modes:
-        console.print(
-            f"[red]Invalid --validation value:[/red] '{validation}'. "
-            f"Choose from: {', '.join(valid_modes)}"
-        )
-        raise typer.Exit(code=1)
-
-    result = run_pipeline(
-        stages=stage_list,
+    """Legacy alias for targeted pipeline execution."""
+    _run_pipeline_command(
+        stages=stages,
         min_score=min_score,
-        dry_run=dry_run,
-        stream=stream,
         workers=workers,
-        validation_mode=validation,
-        headless=not show_browser,
+        stream=stream,
+        dry_run=dry_run,
+        resume=resume,
+        validation=validation,
+        show_browser=show_browser,
+        reset_enrich_errors=reset_enrich_errors,
+        remove_enrich_errors=remove_enrich_errors,
         site_filter=site_filter,
+        llm=llm,
+        llm_model=llm_model,
     )
-
-    # Check if we stopped due to usage limit
-    if result.get("usage_limit"):
-        _show_usage_limit_exit(result.get("reset_at"))
-        raise typer.Exit(code=2)
-
-    if result.get("errors"):
-        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -387,7 +830,9 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
+    llm_model: Optional[str] = typer.Option(None, "--llm-model", help="Override the apply LLM model."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Deprecated alias for --llm-model."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -432,70 +877,38 @@ def apply(
     """
     _bootstrap()
 
-    from applypilot.config import (
-        check_tier,
-        PROFILE_PATH as _profile_path,
-        get_chrome_profile_directory,
-    )
-    from applypilot.database import get_connection
+    from applypilot.config import PROFILE_PATH as _profile_path, get_chrome_profile_directory
+
+    provider = _set_llm_provider_override(llm)
+    effective_model = _resolve_llm_model_option(llm_model, model, default="haiku")
+    _set_llm_model_override(effective_model)
 
     # --- Utility modes (no Chrome/Claude needed) ---
 
     if mark_applied:
-        from applypilot.apply.launcher import mark_job
-        mark_job(mark_applied, "applied")
-        console.print(f"[green]Marked as applied:[/green] {mark_applied}")
+        _mark_applied(mark_applied)
         return
 
     if mark_failed:
-        from applypilot.apply.launcher import mark_job
-        mark_job(mark_failed, "failed", reason=fail_reason)
-        console.print(f"[yellow]Marked as failed:[/yellow] {mark_failed} ({fail_reason or 'manual'})")
+        _mark_failed(mark_failed, fail_reason)
         return
 
     if reset_failed:
-        from applypilot.apply.launcher import reset_failed as do_reset
-        count = do_reset()
-        console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
+        _reset_failed_jobs()
         return
 
     if remove_expired:
-        from applypilot.apply.launcher import remove_expired as do_remove
-        count = do_remove()
-        console.print(f"[green]Removed {count} expired job(s).[/green]")
+        _remove_expired_jobs()
         return
 
     if reset_in_progress:
-        from applypilot.apply.launcher import reset_in_progress as do_reset_in_progress
-        count = do_reset_in_progress()
-        console.print(f"[green]Reset {count} in-progress job(s).[/green]")
+        _reset_in_progress_jobs()
         return
 
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
-    check_tier(3, "auto-apply")
-
-    # Check 2: Profile exists
-    if not _profile_path.exists():
-        console.print(
-            "[red]Profile not found.[/red]\n"
-            "Run [bold]applypilot init[/bold] to create your profile first."
-        )
-        raise typer.Exit(code=1)
-
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
-    if not (gen and url):
-        conn = get_connection()
-        ready = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
-        ).fetchone()[0]
-        if ready == 0:
-            console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
-            )
-            raise typer.Exit(code=1)
+    _ensure_apply_provider_supported(provider)
+    _ensure_apply_ready(gen=gen, url=url)
 
     if gen:
         from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
@@ -503,7 +916,7 @@ def apply(
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
             raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score, model=model)
+        prompt_file = gen_prompt(target, min_score=min_score, model=effective_model or "haiku")
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
@@ -511,7 +924,7 @@ def apply(
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
         console.print(f"\n[bold]Run manually:[/bold]")
         console.print(
-            f"  claude --model {model} -p "
+            f"  {provider} --model {effective_model or 'haiku'} -p "
             f"--mcp-config {mcp_path} "
             f"--permission-mode bypassPermissions < {prompt_file}"
         )
@@ -527,7 +940,8 @@ def apply(
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
+    console.print(f"  Provider: {provider}")
+    console.print(f"  Model:    {effective_model or 'haiku'}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Live profile: {live_chrome_profile}")
     console.print(f"  Chrome profile dir: {effective_profile_directory}")
@@ -561,7 +975,7 @@ def apply(
             target_url=url,
             min_score=min_score,
             headless=headless,
-            model=model,
+            model=effective_model or "haiku",
             dry_run=dry_run,
             continuous=continuous,
             workers=workers,
@@ -569,21 +983,7 @@ def apply(
             chrome_profile_directory=effective_profile_directory,
             allow_real_profile_fallback=live_profile_fallback,
         )
-        if not dry_run:
-            from applypilot.apply.chrome import open_worker_profile_browser
-            try:
-                open_worker_profile_browser(
-                    worker_id=0,
-                    profile_directory=effective_profile_directory,
-                )
-                console.print(
-                    f"[cyan]Opened worker Chrome profile:[/cyan] "
-                    f"worker-0 / {effective_profile_directory}"
-                )
-            except Exception as exc:
-                console.print(
-                    f"[yellow]Could not auto-open worker Chrome profile:[/yellow] {exc}"
-                )
+        _post_apply_success(dry_run=dry_run, profile_directory=effective_profile_directory)
     except UsageLimitError as ule:
         reset_at = estimate_reset_time(ule.raw_message)
         save_session(
@@ -597,7 +997,9 @@ def apply(
                 "chrome_profile_directory": effective_profile_directory,
                 "live_profile_fallback": live_profile_fallback,
                 "close_all_chrome": close_all_chrome,
-                "model": model,
+                "llm_provider": provider,
+                "llm_model": effective_model,
+                "model": effective_model,
                 "dry_run": dry_run,
                 "continuous": continuous,
                 "workers": workers,
@@ -612,11 +1014,17 @@ def apply(
 @app.command()
 def resume(
     llm: str = typer.Option(None, "--llm", "--LLM", help="LLM provider override: claude, gemini, openai, codex."),
+    llm_model: str = typer.Option(None, "--llm-model", help="Override the general-tier model (e.g. gemini-2.5-flash, gemini-2.5-flash-lite)."),
 ) -> None:
     """Resume the last saved pipeline session.
 
     Equivalent to running the original command with --resume.
     """
+    if not isinstance(llm, str):
+        llm = None
+    if not isinstance(llm_model, str):
+        llm_model = None
+
     _bootstrap()
 
     from applypilot.session import load_session, clear_session
@@ -624,7 +1032,7 @@ def resume(
     session = load_session()
     if session is None:
         console.print("[yellow]No saved session found.[/yellow]")
-        console.print("Run [bold]applypilot run[/bold] to start a new pipeline.")
+        console.print("Run [bold]applypilot pipeline[/bold] to start a new pipeline.")
         raise typer.Exit(code=0)
 
     command = session.get("command", "run")
@@ -652,6 +1060,10 @@ def resume(
             _set_llm_provider_override(provider)
         elif llm is not None:
             _set_llm_provider_override(llm)
+        if llm_model:
+            _set_llm_model_override(llm_model)
+        else:
+            _set_llm_model_override(saved_args.get("llm_model") or saved_args.get("model"))
 
         result = run_pipeline(
             stages=stage_list,
@@ -676,6 +1088,16 @@ def resume(
         from applypilot.session import save_session, estimate_reset_time
         from applypilot.config import get_chrome_profile_directory
 
+        saved_provider = saved_args.get("llm_provider")
+        effective_llm_model = _resolve_llm_model_option(
+            llm_model,
+            saved_args.get("model"),
+            default=saved_args.get("llm_model") or saved_args.get("model") or "haiku",
+        )
+        _set_llm_model_override(effective_llm_model)
+        provider = _set_llm_provider_override(llm or saved_provider or "claude")
+        _ensure_apply_provider_supported(provider)
+
         apply_args = {
             "limit": saved_args.get("limit", 1),
             "target_url": saved_args.get("target_url"),
@@ -689,7 +1111,7 @@ def resume(
             ),
             "allow_real_profile_fallback": saved_args.get("live_profile_fallback", False),
             "close_all_chrome": saved_args.get("close_all_chrome", False),
-            "model": saved_args.get("model", "haiku"),
+            "model": effective_llm_model or "haiku",
             "dry_run": saved_args.get("dry_run", False),
             "continuous": saved_args.get("continuous", False),
             "workers": saved_args.get("workers", 1),
@@ -717,7 +1139,11 @@ def resume(
             reset_at = estimate_reset_time(ule.raw_message)
             save_session(
                 command="apply",
-                args=apply_args,
+                args={
+                    **apply_args,
+                    "llm_provider": os.environ.get("LLM_PROVIDER"),
+                    "llm_model": os.environ.get("LLM_MODEL"),
+                },
                 reason="usage_limit",
                 reset_at=reset_at,
             )
@@ -726,6 +1152,60 @@ def resume(
     else:
         console.print(f"[red]Unknown saved command:[/red] '{command}'")
         raise typer.Exit(code=1)
+
+
+@reset_app.command("failed")
+def reset_failed_command() -> None:
+    """Reset failed apply jobs for retry."""
+    _reset_failed_jobs()
+
+
+@reset_app.command("in-progress")
+def reset_in_progress_command() -> None:
+    """Reset stale in-progress apply jobs."""
+    _reset_in_progress_jobs()
+
+
+@remove_app.command("expired")
+def remove_expired_command() -> None:
+    """Remove expired jobs from the database."""
+    _remove_expired_jobs()
+
+
+@mark_app.command("applied")
+def mark_applied_command(
+    url: str = typer.Option(..., "--url", help="Job URL to mark as applied."),
+) -> None:
+    """Mark a job as applied."""
+    _mark_applied(url)
+
+
+@mark_app.command("failed")
+def mark_failed_command(
+    url: str = typer.Option(..., "--url", help="Job URL to mark as failed."),
+    reason: Optional[str] = typer.Option(None, "--reason", help="Reason for the failed mark."),
+) -> None:
+    """Mark a job as failed."""
+    _mark_failed(url, reason)
+
+
+@export_app.command("ready-jobs")
+def export_ready_jobs_command(
+    output: Optional[Path] = typer.Option(None, "--output", help="Output .xlsx path."),
+    min_score: Optional[int] = typer.Option(None, "--min-score", help="Minimum fit score to include."),
+    include_failed: bool = typer.Option(False, "--include-failed", help="Include failed-but-ready jobs."),
+) -> None:
+    """Export ready-to-apply jobs to an Excel workbook."""
+    _bootstrap()
+    _export_ready_jobs(output=output, min_score=min_score, include_failed=include_failed)
+
+
+@app.command("help")
+def help_command(
+    topic: Optional[str] = typer.Argument(None, help="Optional help topic, such as pipeline or apply."),
+) -> None:
+    """Show command help without requiring --help."""
+    _print_help(topic)
 
 
 @app.command()
@@ -765,7 +1245,7 @@ def status() -> None:
 
     next_stage = stats["next_stage_to_run"]
     if next_stage in VALID_STAGES:
-        next_cmd = f"applypilot run {next_stage}"
+        next_cmd = f"applypilot {next_stage}"
     elif next_stage == "apply":
         next_cmd = "applypilot apply"
     else:

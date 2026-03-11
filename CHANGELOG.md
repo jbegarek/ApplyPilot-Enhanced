@@ -5,6 +5,17 @@ All notable changes to ApplyPilot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Canonical CLI command layout** - `applypilot pipeline` now runs the full pipeline, direct stage commands such as `applypilot score` and `applypilot tailor` are available, and maintenance actions are exposed as `reset`, `remove`, and `mark` command groups.
+- **Explicit help command** - `applypilot help` and `applypilot help <topic>` provide discoverable command help without requiring `--help`.
+- **Ready-jobs Excel export** - `applypilot export ready-jobs` writes an `.xlsx` workbook for manual application workflows with a curated `ready_to_apply` sheet and a `raw_ready_jobs` sheet. Cover letters are optional for exported jobs.
+
+### Changed
+- **Standardized LLM flags** - `applypilot apply` now accepts `--llm` and `--llm-model` to match the pipeline commands. `--model` remains as a deprecated compatibility alias.
+- **Canonical docs/examples** - help text and documentation now prefer `pipeline`, direct stage commands, and grouped maintenance commands while keeping the older `run` and apply utility flags working for compatibility.
+
 ## [0.2.0] - 2026-02-17
 
 ### Added
@@ -23,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `poll_interval`, `apply_timeout`, `viewport`)
 
 ### Fixed
+- **Apply provider validation** - `applypilot apply` and `applypilot resume` now fail fast when a non-Claude provider is selected, instead of reaching the Claude-only auto-apply runner and surfacing a misleading `NO RESULT` failure.
 - **Config YAML not found after install** - moved `config/` into the package at
   `src/applypilot/config/` so YAML files (employers, sites, searches) ship with `pip install`
 - **Search config format mismatch** - wizard wrote `searches:` key but discovery code
