@@ -7,7 +7,8 @@ Selects provider via LLM_PROVIDER env var (default: claude):
   openai  — OpenAI API; requires OPENAI_API_KEY
   codex   — Codex CLI (preferred) or OpenAI API fallback
 
-LLM_MODEL overrides the default model for the selected provider.
+LLM_MODEL overrides the default model for the general tier.
+LLM_MODEL_GENERAL / LLM_MODEL_TAILOR override per-tier models.
 """
 
 import logging
@@ -26,7 +27,7 @@ log = logging.getLogger(__name__)
 
 _PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "claude": {"general": "sonnet",           "tailor": "claude-opus-4-6"},
-    "gemini": {"general": "gemini-2.0-flash", "tailor": "gemini-2.5-pro"},
+    "gemini": {"general": "gemini-2.5-flash-lite", "tailor": "gemini-2.5-pro"},
     "openai": {"general": "gpt-4o-mini",      "tailor": "gpt-4o"},
     "codex":  {"general": "auto",             "tailor": "auto"},
 }
@@ -43,16 +44,27 @@ def _is_provider_default_override(model: str | None) -> bool:
 
 
 def _model(tier: str = "general") -> str:
-    """Return the model name for the current provider and tier."""
+    """Return the model name for the current provider and tier.
+
+    Resolution order:
+      1. LLM_MODEL_GENERAL / LLM_MODEL_TAILOR (per-tier override)
+      2. LLM_MODEL (general-tier override only, tailor is unaffected)
+      3. Provider defaults
+    """
     prov = _provider()
     defaults = _PROVIDER_DEFAULTS.get(prov, _PROVIDER_DEFAULTS["claude"])
+
+    # 1. Per-tier env var (highest priority)
+    tier_env = f"LLM_MODEL_{tier.upper()}"
+    tier_override = (os.environ.get(tier_env) or "").strip()
+    if tier_override and not _is_provider_default_override(tier_override):
+        return tier_override
+
+    # 2. LLM_MODEL applies to general tier only (keeps tailor on its own default)
     override = (os.environ.get("LLM_MODEL") or "").strip()
-    if override:
+    if override and tier == "general":
         if _is_provider_default_override(override):
             return defaults[tier]
-        if override in defaults.values():
-            return override
-
         # Ignore stale provider-specific defaults (e.g. sonnet) after --llm switches.
         for other_provider, other_defaults in _PROVIDER_DEFAULTS.items():
             if other_provider == prov:
@@ -278,7 +290,7 @@ class ClaudeCLIClient:
 class GeminiCLIClient:
     """LLM client via Gemini CLI in headless mode with stdin-fed prompts."""
 
-    def __init__(self, model: str = "gemini-2.0-flash") -> None:
+    def __init__(self, model: str = "gemini-2.5-flash") -> None:
         self.model = model
         self.executable = shutil.which("gemini") or "gemini"
 
@@ -365,7 +377,7 @@ class GeminiClient:
     Env var:  GEMINI_API_KEY
     """
 
-    def __init__(self, model: str = "gemini-2.0-flash") -> None:
+    def __init__(self, model: str = "gemini-2.5-flash") -> None:
         self.model = model
         self._client = None
 

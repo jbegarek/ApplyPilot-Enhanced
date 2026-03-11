@@ -88,7 +88,10 @@ def _parse_score_response(response: str) -> dict:
     """
     score = 0
     keywords = ""
-    reasoning = response
+    reasoning = response or ""
+
+    if not response:
+        return {"score": 0, "keywords": "", "reasoning": "Empty LLM response"}
 
     for line in response.split("\n"):
         line = line.strip()
@@ -117,9 +120,9 @@ def score_job(resume_text: str, job: dict) -> dict:
         {"score": int, "keywords": str, "reasoning": str}
     """
     job_text = (
-        f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
-        f"LOCATION: {job.get('location', 'N/A')}\n\n"
+        f"TITLE: {job.get('title') or 'N/A'}\n"
+        f"COMPANY: {job.get('site') or 'N/A'}\n"
+        f"LOCATION: {job.get('location') or 'N/A'}\n\n"
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
 
@@ -152,7 +155,7 @@ def score_job(resume_text: str, job: dict) -> dict:
     except UsageLimitError:
         raise
     except Exception as e:
-        log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
+        log.error("LLM error scoring job '%s': %s", job.get("title") or "?", e)
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
 
 
@@ -190,34 +193,36 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     t0 = time.time()
     completed = 0
     errors = 0
-    results: list[dict] = []
 
     for job in jobs:
-        result = score_job(resume_text, job)
-        result["url"] = job["url"]
-        completed += 1
+        try:
+            result = score_job(resume_text, job)
+            completed += 1
 
-        if result["score"] == 0:
+            if result["score"] == 0:
+                errors += 1
+
+            # Write score to DB immediately so progress survives crashes
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+                (result["score"], f"{result['keywords']}\n{result['reasoning']}", now, job["url"]),
+            )
+            conn.commit()
+
+            log.info(
+                "[%d/%d] score=%d  %s",
+                completed, len(jobs), result["score"], (job.get("title") or "?")[:60],
+            )
+        except UsageLimitError:
+            raise
+        except Exception as e:
             errors += 1
-
-        results.append(result)
-
-        log.info(
-            "[%d/%d] score=%d  %s",
-            completed, len(jobs), result["score"], job.get("title", "?")[:60],
-        )
-
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
+            completed += 1
+            log.error("[%d/%d] SKIP (error: %s)  %s", completed, len(jobs), e, (job.get("title") or "?")[:60])
 
     elapsed = time.time() - t0
-    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
+    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", completed, elapsed, completed / elapsed if elapsed > 0 else 0)
 
     # Score distribution
     dist = conn.execute("""
@@ -228,7 +233,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     distribution = [(row[0], row[1]) for row in dist]
 
     return {
-        "scored": len(results),
+        "scored": completed,
         "errors": errors,
         "elapsed": elapsed,
         "distribution": distribution,

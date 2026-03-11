@@ -162,7 +162,8 @@ def _run_score() -> dict:
     except UsageLimitError:
         raise
     except Exception as e:
-        log.error("Scoring failed: %s", e)
+        import traceback
+        log.error("Scoring failed: %s\n%s", e, traceback.format_exc())
         return {"status": f"error: {e}"}
 
 

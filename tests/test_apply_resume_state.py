@@ -127,3 +127,40 @@ def test_resume_apply_saves_session_on_usage_limit(monkeypatch: pytest.MonkeyPat
     assert len(saved) == 1
     assert saved[0]["command"] == "apply"
     assert saved[0]["reason"] == "usage_limit"
+
+
+def test_resume_apply_reads_normalized_llm_session_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    session_data = {
+        "command": "apply",
+        "args": {
+            "limit": 1,
+            "target_url": None,
+            "min_score": 7,
+            "headless": False,
+            "llm_provider": "gemini",
+            "llm_model": "gemini-2.5-flash",
+            "dry_run": True,
+            "continuous": False,
+            "workers": 1,
+        },
+        "reason": "usage_limit",
+        "saved_at": "2026-03-02T00:00:00+00:00",
+    }
+    captured: list[dict] = []
+
+    monkeypatch.setattr(cli, "_bootstrap", lambda: None)
+
+    import applypilot.session as session_mod
+    import applypilot.apply.launcher as launcher_mod
+
+    monkeypatch.setattr(session_mod, "load_session", lambda: session_data)
+    monkeypatch.setattr(session_mod, "clear_session", lambda: None)
+    monkeypatch.setattr(launcher_mod, "main", lambda **kwargs: captured.append(kwargs))
+
+    with pytest.raises(typer.Exit) as exc:
+        cli.resume()
+
+    assert exc.value.exit_code == 1
+    assert cli.os.environ["LLM_PROVIDER"] == "gemini"
+    assert cli.os.environ["LLM_MODEL"] == "gemini-2.5-flash"
+    assert captured == []

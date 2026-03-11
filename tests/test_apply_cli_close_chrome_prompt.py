@@ -229,3 +229,49 @@ def test_apply_reset_in_progress_uses_utility_mode(monkeypatch) -> None:
     finally:
         conn.close()
         shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def test_reset_failed_command_uses_utility_mode(monkeypatch) -> None:
+    tmp_root = _make_test_dir()
+    conn = _setup_apply_prereqs(monkeypatch, tmp_root)
+    reset_calls: list[int] = []
+
+    monkeypatch.setattr(
+        launcher_mod,
+        "reset_failed",
+        lambda: (reset_calls.append(1), 3)[1],
+        raising=False,
+    )
+
+    try:
+        result = runner.invoke(cli.app, ["reset", "failed"])
+
+        assert result.exit_code == 0
+        assert len(reset_calls) == 1
+        assert "Reset 3 failed job(s)" in result.output
+    finally:
+        conn.close()
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def test_remove_expired_command_uses_utility_mode(monkeypatch) -> None:
+    tmp_root = _make_test_dir()
+    conn = _setup_apply_prereqs(monkeypatch, tmp_root)
+    remove_calls: list[int] = []
+
+    monkeypatch.setattr(
+        launcher_mod,
+        "remove_expired",
+        lambda: (remove_calls.append(1), 2)[1],
+        raising=False,
+    )
+
+    try:
+        result = runner.invoke(cli.app, ["remove", "expired"])
+
+        assert result.exit_code == 0
+        assert len(remove_calls) == 1
+        assert "Removed 2 expired job(s)" in result.output
+    finally:
+        conn.close()
+        shutil.rmtree(tmp_root, ignore_errors=True)
