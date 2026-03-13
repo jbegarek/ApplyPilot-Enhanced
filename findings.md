@@ -30,3 +30,26 @@
   - `tests/discovery/test_greenhouse.py`: 16 passing tests plus 2 environment-blocked temp-path tests under sandboxed Windows permissions
   - `tests/test_lensa_filters.py` and `tests/test_lensa_pagination.py`: passing after Greenhouse integration
   - manual checks confirmed `load_employers()` missing-file behavior and `_store_jobs()` database writes
+- LiteLLM migration slice landed locally with:
+  - new `LLMConfig`, `LLMClient`, and `resolve_llm_config()` in `src/applypilot/llm.py`
+  - compatibility-preserving `UsageLimitError`, `_model()`, `_make_client()`, `get_client()`, and `get_tailor_client()`
+  - `litellm` dependency added to `pyproject.toml`
+  - `.env.example` updated to the multi-provider/provider-prefixed model contract
+  - wizard AI step updated to collect Gemini/OpenAI/Anthropic/local endpoint configuration
+- Verification status for LiteLLM slice:
+  - `tests/test_llm_client.py`, `tests/test_llm_resolution.py`, `tests/test_cli_llm_option.py`, `tests/test_apply_resume_state.py`, `tests/test_init_wizard.py`, `tests/test_wizard_ai_features.py`: 31 passed
+  - Greenhouse + adjacent discovery regressions still passing after LiteLLM work
+- Old `tests/test_llm_cli_auth.py` still targets the removed pre-LiteLLM Gemini/Codex/Claude CLI client layer and is now obsolete relative to the migrated contract.
+- Dashboard slice landed locally:
+  - `src/applypilot/view.py` now includes submitted/failed application tables, applied/failed card indicators, auto-apply copy buttons, hide-applied filtering, and more defensive optional-field rendering
+  - `tests/test_view_dashboard.py` covers the new dashboard states
+- Logging cleanup landed locally:
+  - `src/applypilot/cli.py` now configures colorized console logging and quiets noisy SDK/network loggers unless debug logging is selected
+  - `tests/test_cli_logging.py` verifies logger levels for normal and debug modes
+- Dry-run behavior is now more coherent:
+  - `pipeline --dry-run` and stage `--dry-run` no longer fail early on non-Claude provider readiness checks
+  - `tests/test_cli_llm_option.py` includes explicit coverage for that path
+- Artifact-flow refinements from `comparetarget/main` were reviewed against local code:
+  - the important pieces were already present locally, especially immediate DB persistence in scoring/tailoring, safe writes for tailored artifacts, and `convert_to_pdf()`-based PDF generation
+  - no additional artifact-flow patch was required after review
+- Tier 3 repo hygiene landed with `SECURITY.md`

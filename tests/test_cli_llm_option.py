@@ -61,6 +61,29 @@ def test_direct_stage_command_runs_stage(monkeypatch) -> None:
     assert captured["stages"] == ["score"]
 
 
+def test_pipeline_dry_run_skips_provider_readiness(monkeypatch) -> None:
+    captured: dict = {}
+
+    monkeypatch.setattr(cli, "_bootstrap", lambda: None)
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(
+        cli,
+        "_ensure_llm_provider_ready",
+        lambda _provider: (_ for _ in ()).throw(AssertionError("should not validate provider for dry-run")),
+    )
+
+    def _run_pipeline(**kwargs):
+        captured.update(kwargs)
+        return {"usage_limit": False, "errors": {}}
+
+    monkeypatch.setattr(pipeline, "run_pipeline", _run_pipeline)
+
+    result = runner.invoke(cli.app, ["pipeline", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert captured["stages"] == ["all"]
+
+
 def test_run_accepts_uppercase_llm_alias(monkeypatch) -> None:
     monkeypatch.setattr(cli, "_bootstrap", lambda: None)
     monkeypatch.setenv("LLM_PROVIDER", "claude")
@@ -215,7 +238,7 @@ def test_run_score_with_codex_shows_provider_error_when_not_ready(monkeypatch) -
     monkeypatch.setattr(config, "check_tier", _fail_check_tier)
     monkeypatch.setattr(llm, "_make_client", _raise_not_ready)
 
-    result = runner.invoke(cli.app, ["run", "score", "--dry-run", "--llm", "codex"])
+    result = runner.invoke(cli.app, ["run", "score", "--llm", "codex"])
 
     assert result.exit_code == 1
     assert "LLM provider 'codex' is not ready" in result.stdout

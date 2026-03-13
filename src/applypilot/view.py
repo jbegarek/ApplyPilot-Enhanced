@@ -10,14 +10,14 @@ Generates a self-contained HTML dashboard with:
 
 from __future__ import annotations
 
-import os
 import webbrowser
+from datetime import datetime
 from html import escape
 from pathlib import Path
 
 from rich.console import Console
 
-from applypilot.config import APP_DIR, DB_PATH
+from applypilot.config import APP_DIR
 from applypilot.database import get_connection
 
 console = Console()
@@ -36,7 +36,6 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
     conn = get_connection()
 
-    # Stats
     total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     ready = conn.execute(
         "SELECT COUNT(*) FROM jobs "
@@ -49,7 +48,6 @@ def generate_dashboard(output_path: str | None = None) -> str:
         "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7"
     ).fetchone()[0]
 
-    # Score distribution
     score_dist: dict[int, int] = {}
     if scored:
         rows = conn.execute(
@@ -57,10 +55,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
             "WHERE fit_score IS NOT NULL "
             "GROUP BY fit_score ORDER BY fit_score DESC"
         ).fetchall()
-        for r in rows:
-            score_dist[r[0]] = r[1]
+        for row in rows:
+            score_dist[row[0]] = row[1]
 
-    # Site stats
     site_stats = conn.execute("""
         SELECT site,
                COUNT(*) as total,
@@ -72,18 +69,39 @@ def generate_dashboard(output_path: str | None = None) -> str:
         FROM jobs GROUP BY site ORDER BY high_fit DESC, total DESC
     """).fetchall()
 
-    # All scored jobs (5+), ordered by score desc
     jobs = conn.execute("""
         SELECT url, title, salary, description, location, site, strategy,
                full_description, application_url, detail_error,
-               fit_score, score_reasoning
+               fit_score, score_reasoning,
+               applied_at, apply_status, apply_error, last_attempted_at
         FROM jobs
         WHERE fit_score >= 5
         ORDER BY fit_score DESC, site, title
+        LIMIT 500
     """).fetchall()
 
-    # Color map per site
-    colors = {
+    applied_jobs = conn.execute("""
+        SELECT url, title, site, location, fit_score,
+               applied_at, apply_duration_ms, application_url
+        FROM jobs
+        WHERE apply_status = 'applied' AND applied_at IS NOT NULL
+        ORDER BY applied_at DESC
+    """).fetchall()
+
+    failed_jobs = conn.execute("""
+        SELECT url, title, site, location, fit_score,
+               apply_status, apply_error, apply_attempts, last_attempted_at,
+               application_url
+        FROM jobs
+        WHERE apply_status IS NOT NULL AND apply_status != 'applied'
+          AND apply_attempts > 0
+        ORDER BY last_attempted_at DESC
+    """).fetchall()
+
+    applied_count = len(applied_jobs)
+    failed_count = len(failed_jobs)
+
+    known_colors = {
         "RemoteOK": "#10b981", "WelcomeToTheJungle": "#f59e0b",
         "Job Bank Canada": "#3b82f6", "CareerJet Canada": "#8b5cf6",
         "Hacker News Jobs": "#ff6600", "BuiltIn Remote": "#ec4899",
@@ -92,43 +110,49 @@ def generate_dashboard(output_path: str | None = None) -> str:
         "Dice": "#eb1c26", "Glassdoor": "#0caa41",
     }
 
-    # Score distribution bar chart
+    def _site_color(site: str) -> str:
+        if site in known_colors:
+            return known_colors[site]
+        hue = hash(site) % 360
+        return f"hsl({hue}, 60%, 45%)"
+
+    colors = {site: _site_color(site) for site in set((job["site"] or "") for job in jobs)}
+    colors.update(known_colors)
+
     score_bars = ""
     max_count = max(score_dist.values()) if score_dist else 1
-    for s in range(10, 0, -1):
-        count = score_dist.get(s, 0)
+    for score in range(10, 0, -1):
+        count = score_dist.get(score, 0)
         pct = (count / max_count * 100) if max_count else 0
-        score_color = "#10b981" if s >= 7 else ("#f59e0b" if s >= 5 else "#ef4444")
+        score_color = "#10b981" if score >= 7 else ("#f59e0b" if score >= 5 else "#ef4444")
         score_bars += f"""
         <div class="score-row">
-          <span class="score-label">{s}</span>
+          <span class="score-label">{score}</span>
           <div class="score-bar-track">
             <div class="score-bar-fill" style="width:{pct}%;background:{score_color}"></div>
           </div>
           <span class="score-count">{count}</span>
         </div>"""
 
-    # Site stats rows
     site_rows = ""
-    for s in site_stats:
-        site = s["site"] or "?"
+    for site_stat in site_stats:
+        site = site_stat["site"] or "?"
         color = colors.get(site, "#6b7280")
-        avg = s["avg_score"] or 0
+        avg = site_stat["avg_score"] or 0
         site_rows += f"""
         <div class="site-row">
           <div class="site-name" style="color:{color}">{escape(site)}</div>
-          <div class="site-nums">{s['total']} jobs &middot; {s['high_fit']} strong fit &middot; avg score {avg}</div>
+          <div class="site-nums">{site_stat['total']} jobs &middot; {site_stat['high_fit']} strong fit &middot; avg score {avg}</div>
           <div class="bar-track">
-            <div class="bar-fill" style="width:{s['high_fit']/max(s['total'],1)*100}%;background:{color}"></div>
-            <div class="bar-fill" style="width:{s['mid_fit']/max(s['total'],1)*100}%;background:{color}66"></div>
+            <div class="bar-fill" style="width:{site_stat['high_fit']/max(site_stat['total'],1)*100}%;background:{color}"></div>
+            <div class="bar-fill" style="width:{site_stat['mid_fit']/max(site_stat['total'],1)*100}%;background:{color}66"></div>
           </div>
         </div>"""
 
-    # Job cards grouped by score
     job_sections = ""
     current_score = None
-    for j in jobs:
-        score = j["fit_score"] or 0
+    for job in jobs:
+        score = job["fit_score"] or 0
         if score != current_score:
             if current_score is not None:
                 job_sections += "</div>"
@@ -146,28 +170,26 @@ def generate_dashboard(output_path: str | None = None) -> str:
             <div class="job-grid">"""
             current_score = score
 
-        title = escape(j["title"] or "Untitled")
-        url = escape(j["url"] or "")
-        salary = escape(j["salary"] or "")
-        location = escape(j["location"] or "")
-        site = escape(j["site"] or "")
-        site_color = colors.get(j["site"] or "", "#6b7280")
-        apply_url = escape(j["application_url"] or "")
+        title = escape(job["title"] or "Untitled")
+        url = escape(job["url"] or "")
+        salary = escape(job["salary"] or "")
+        location = escape(job["location"] or "")
+        site = escape(job["site"] or "")
+        site_color = colors.get(job["site"] or "", "#6b7280")
+        apply_url = escape(job["application_url"] or "")
 
-        # Parse keywords and reasoning from score_reasoning
-        reasoning_raw = j["score_reasoning"] or ""
+        reasoning_raw = job["score_reasoning"] or ""
         reasoning_lines = reasoning_raw.split("\n")
         keywords = reasoning_lines[0][:120] if reasoning_lines else ""
         reasoning = reasoning_lines[1][:200] if len(reasoning_lines) > 1 else ""
 
-        desc_preview = escape(j["full_description"] or "")[:300]
-        full_desc_html = escape(j["full_description"] or "").replace("\n", "<br>")
-        desc_len = len(j["full_description"] or "")
+        desc_preview = escape(job["full_description"] or "")[:300]
+        full_desc_html = escape(job["full_description"] or "").replace("\n", "<br>")
+        desc_len = len(job["full_description"] or "")
 
-        meta_parts = []
-        meta_parts.append(
+        meta_parts = [
             f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>'
-        )
+        ]
         if salary:
             meta_parts.append(f'<span class="meta-tag salary">{salary}</span>')
         if location:
@@ -178,8 +200,63 @@ def generate_dashboard(output_path: str | None = None) -> str:
         if apply_url:
             apply_html = f'<a href="{apply_url}" class="apply-link" target="_blank">Apply</a>'
 
+        raw_url = job["url"] or ""
+        auto_apply_cmd = f"applypilot apply --url {raw_url}"
+
+        was_applied = job["apply_status"] == "applied" and job["applied_at"]
+        applied_banner = ""
+        applied_attr = ""
+        if was_applied:
+            try:
+                applied_dt = datetime.fromisoformat(job["applied_at"].replace("Z", "+00:00"))
+                applied_date_str = applied_dt.strftime("%b %d, %Y")
+            except (ValueError, AttributeError):
+                applied_date_str = job["applied_at"][:10]
+            applied_banner = f'<div class="applied-banner">&#10003; Applied on {applied_date_str}</div>'
+            applied_attr = ' data-applied="true"'
+
+        status_reasons = {
+            "expired": "Job posting expired",
+            "captcha": "CAPTCHA blocked",
+            "login_issue": "Login required",
+            "not_eligible_location": "Location not eligible",
+            "not_eligible_salary": "Salary not eligible",
+            "already_applied": "Already applied",
+            "account_required": "Account required",
+            "not_a_job_application": "Not a job posting",
+            "unsafe_permissions": "Unsafe permissions",
+            "unsafe_verification": "Unsafe verification",
+            "sso_required": "SSO required",
+            "site_blocked": "Site blocked",
+            "cloudflare_blocked": "Cloudflare blocked",
+            "failed": "Application failed",
+        }
+        was_failed = (
+            job["apply_status"] and job["apply_status"] != "applied"
+            and job["last_attempted_at"]
+        )
+        failed_banner = ""
+        if was_failed:
+            try:
+                failed_dt = datetime.fromisoformat(job["last_attempted_at"].replace("Z", "+00:00"))
+                failed_date_str = failed_dt.strftime("%b %d, %Y")
+            except (ValueError, AttributeError):
+                failed_date_str = job["last_attempted_at"][:10]
+            short_reason = (
+                escape((job["apply_error"] or "")[:60]) or
+                status_reasons.get(job["apply_status"], job["apply_status"].replace("_", " ").title())
+            )
+            failed_banner = f'<div class="failed-banner">&#10007; Failed on {failed_date_str} &middot; {short_reason}</div>'
+
+        card_extra_class = ""
+        if was_applied:
+            card_extra_class = " job-card--applied"
+        elif was_failed:
+            card_extra_class = " job-card--failed"
+
         job_sections += f"""
-        <div class="job-card" data-score="{score}" data-site="{escape(j['site'] or '')}" data-location="{location.lower()}">
+        <div class="job-card{card_extra_class}" data-score="{score}" data-site="{escape(job['site'] or '')}" data-location="{escape(location.lower())}"{applied_attr}>
+          {applied_banner}{failed_banner}
           <div class="card-header">
             <span class="score-pill" style="background:{'#10b981' if score >= 7 else '#f59e0b'}">{score}</span>
             <a href="{url}" class="job-title" target="_blank">{title}</a>
@@ -188,12 +265,110 @@ def generate_dashboard(output_path: str | None = None) -> str:
           {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
           {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
           <p class="desc-preview">{desc_preview}...</p>
-          {"<details class='full-desc-details'><summary class='expand-btn'>Full Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + full_desc_html + "</div></details>" if j["full_description"] else ""}
-          <div class="card-footer">{apply_html}</div>
+          {"<details class='full-desc-details'><summary class='expand-btn'>Full Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + full_desc_html + "</div></details>" if job["full_description"] else ""}
+          <div class="card-footer">
+            {apply_html}
+            {"" if was_applied else f'<button class="auto-apply-btn" onclick="copyApplyCmd(this)" data-cmd="{escape(auto_apply_cmd)}" title="{escape(auto_apply_cmd)}">&#9654; Auto-Apply</button>'}
+          </div>
         </div>"""
 
     if current_score is not None:
         job_sections += "</div>"
+
+    def _fmt_date(iso: str | None) -> str:
+        if not iso:
+            return "—"
+        try:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            return escape(iso[:16])
+
+    def _fmt_duration(ms: int | None) -> str:
+        if not ms:
+            return "—"
+        if ms < 60_000:
+            return f"{ms // 1000}s"
+        return f"{ms // 60_000}m {(ms % 60_000) // 1000}s"
+
+    def _score_chip(score: int | None) -> str:
+        if score is None:
+            return '<span style="color:#475569">—</span>'
+        color = "#10b981" if score >= 7 else ("#f59e0b" if score >= 5 else "#ef4444")
+        return f'<span class="score-chip" style="background:{color}">{score}</span>'
+
+    def _status_chip(status: str | None) -> str:
+        if not status:
+            return "—"
+        css = f"status-{status}" if status in (
+            "applied", "expired", "captcha", "login_issue", "failed"
+        ) else "status-default"
+        return f'<span class="status-chip {css}">{escape(status.replace("_", " "))}</span>'
+
+    if applied_jobs:
+        applied_rows = ""
+        for job in applied_jobs:
+            title = escape(job["title"] or "Untitled")
+            url = escape(job["url"] or "#")
+            app_url = escape(job["application_url"] or "")
+            site = escape(job["site"] or "")
+            location = escape(job["location"] or "—")
+            applied_rows += f"""
+            <tr>
+              <td>{_fmt_date(job['applied_at'])}</td>
+              <td><a href="{url}" class="job-link" target="_blank">{title}</a></td>
+              <td>{_score_chip(job['fit_score'])}</td>
+              <td>{site}</td>
+              <td>{location}</td>
+              <td>{_fmt_duration(job['apply_duration_ms'])}</td>
+              <td>{"<a href='" + app_url + "' class='apply-btn' target='_blank'>View</a>" if app_url else "—"}</td>
+            </tr>"""
+        applied_table_html = f"""
+        <div class="app-table-wrap">
+          <table class="app-table">
+            <thead><tr>
+              <th>Date Submitted</th><th>Job Title</th><th>Score</th>
+              <th>Source</th><th>Location</th><th>Duration</th><th>Posting</th>
+            </tr></thead>
+            <tbody>{applied_rows}</tbody>
+          </table>
+        </div>"""
+    else:
+        applied_table_html = '<p class="empty-state">No submitted applications yet.</p>'
+
+    if failed_jobs:
+        failed_rows = ""
+        for job in failed_jobs:
+            title = escape(job["title"] or "Untitled")
+            url = escape(job["url"] or "#")
+            app_url = escape(job["application_url"] or "")
+            site = escape(job["site"] or "")
+            reason = escape(job["apply_error"] or "")
+            attempts = job["apply_attempts"] or 0
+            failed_rows += f"""
+            <tr>
+              <td>{_fmt_date(job['last_attempted_at'])}</td>
+              <td><a href="{url}" class="job-link" target="_blank">{title}</a></td>
+              <td>{_score_chip(job['fit_score'])}</td>
+              <td>{_status_chip(job['apply_status'])}</td>
+              <td class="fail-reason">{reason or "—"}</td>
+              <td style="text-align:center">{attempts}</td>
+              <td>{site}</td>
+              <td>{"<a href='" + app_url + "' class='apply-btn' target='_blank'>View</a>" if app_url else "—"}</td>
+            </tr>"""
+        failed_table_html = f"""
+        <div class="app-table-wrap">
+          <table class="app-table">
+            <thead><tr>
+              <th>Last Attempted</th><th>Job Title</th><th>Score</th>
+              <th>Status</th><th>Failure Reason</th><th>Tries</th>
+              <th>Source</th><th>Posting</th>
+            </tr></thead>
+            <tbody>{failed_rows}</tbody>
+          </table>
+        </div>"""
+    else:
+        failed_table_html = '<p class="empty-state">No failed applications.</p>'
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -208,8 +383,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   h1 {{ font-size: 1.8rem; font-weight: 700; margin-bottom: 0.5rem; }}
   .subtitle {{ color: #94a3b8; margin-bottom: 2rem; }}
 
-  /* Summary cards */
-  .summary {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2.5rem; }}
+  .summary {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 1rem; margin-bottom: 2.5rem; }}
   .stat-card {{ background: #1e293b; border-radius: 12px; padding: 1.25rem; }}
   .stat-num {{ font-size: 2rem; font-weight: 700; }}
   .stat-label {{ color: #94a3b8; font-size: 0.85rem; margin-top: 0.25rem; }}
@@ -218,7 +392,6 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .stat-high .stat-num {{ color: #f59e0b; }}
   .stat-total .stat-num {{ color: #e2e8f0; }}
 
-  /* Filters */
   .filters {{ background: #1e293b; border-radius: 12px; padding: 1.25rem; margin-bottom: 2rem; display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }}
   .filter-label {{ color: #94a3b8; font-size: 0.85rem; font-weight: 600; }}
   .filter-btn {{ background: #334155; border: none; color: #94a3b8; padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.8rem; transition: all 0.15s; }}
@@ -227,7 +400,6 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .search-input {{ background: #334155; border: 1px solid #475569; color: #e2e8f0; padding: 0.4rem 0.8rem; border-radius: 6px; font-size: 0.8rem; width: 200px; }}
   .search-input::placeholder {{ color: #64748b; }}
 
-  /* Score distribution */
   .score-section {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2.5rem; }}
   .score-dist {{ background: #1e293b; border-radius: 12px; padding: 1.5rem; }}
   .score-dist h3 {{ font-size: 1rem; margin-bottom: 1rem; color: #94a3b8; }}
@@ -237,7 +409,6 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .score-bar-fill {{ height: 100%; border-radius: 4px; transition: width 0.3s; }}
   .score-count {{ width: 2.5rem; font-size: 0.8rem; color: #94a3b8; }}
 
-  /* Site bars */
   .sites-section {{ background: #1e293b; border-radius: 12px; padding: 1.5rem; }}
   .sites-section h3 {{ font-size: 1rem; margin-bottom: 1rem; color: #94a3b8; }}
   .site-row {{ margin-bottom: 0.8rem; }}
@@ -246,11 +417,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .bar-track {{ height: 8px; background: #334155; border-radius: 4px; display: flex; overflow: hidden; }}
   .bar-fill {{ height: 100%; transition: width 0.3s; }}
 
-  /* Score group headers */
   .score-header {{ font-size: 1.2rem; font-weight: 600; margin: 2.5rem 0 1rem; padding-bottom: 0.5rem; border-bottom: 3px solid; display: flex; align-items: center; gap: 0.75rem; }}
   .score-badge {{ display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; border-radius: 8px; color: #0f172a; font-weight: 700; font-size: 1rem; }}
 
-  /* Job grid */
   .job-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 1rem; }}
 
   .job-card {{ background: #1e293b; border-radius: 10px; padding: 1rem; border-left: 3px solid #334155; transition: all 0.15s; }}
@@ -277,11 +446,10 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
   .desc-preview {{ font-size: 0.8rem; color: #64748b; line-height: 1.5; margin-bottom: 0.75rem; max-height: 3.6em; overflow: hidden; }}
 
-  .card-footer {{ display: flex; justify-content: flex-end; }}
+  .card-footer {{ display: flex; justify-content: flex-end; gap: 0.5rem; flex-wrap: wrap; }}
   .apply-link {{ font-size: 0.8rem; color: #60a5fa; text-decoration: none; padding: 0.3rem 0.8rem; border: 1px solid #60a5fa33; border-radius: 6px; font-weight: 500; }}
   .apply-link:hover {{ background: #60a5fa22; }}
 
-  /* Expandable full description */
   .full-desc-details {{ margin-bottom: 0.75rem; }}
   .expand-btn {{ font-size: 0.8rem; color: #60a5fa; cursor: pointer; list-style: none; padding: 0.3rem 0; }}
   .expand-btn::-webkit-details-marker {{ display: none; }}
@@ -290,6 +458,49 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
   .hidden {{ display: none !important; }}
   .job-count {{ color: #94a3b8; font-size: 0.85rem; margin-bottom: 1rem; }}
+
+  .app-section {{ margin-bottom: 3rem; }}
+  .app-section h2 {{ font-size: 1.3rem; font-weight: 700; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 2px solid #334155; display: flex; align-items: center; gap: 0.75rem; }}
+  .app-section h2 .count-badge {{ background: #334155; color: #94a3b8; font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 99px; font-weight: 600; }}
+  .app-table-wrap {{ overflow-x: auto; }}
+  .app-table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+  .app-table th {{ text-align: left; padding: 0.6rem 0.75rem; color: #94a3b8; font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid #334155; white-space: nowrap; }}
+  .app-table td {{ padding: 0.65rem 0.75rem; border-bottom: 1px solid #1e293b; vertical-align: top; }}
+  .app-table tr:last-child td {{ border-bottom: none; }}
+  .app-table tr:hover td {{ background: #1e293b44; }}
+  .app-table .job-link {{ color: #e2e8f0; text-decoration: none; font-weight: 600; }}
+  .app-table .job-link:hover {{ color: #60a5fa; }}
+  .app-table .apply-btn {{ color: #60a5fa; text-decoration: none; font-size: 0.78rem; padding: 0.2rem 0.6rem; border: 1px solid #60a5fa33; border-radius: 5px; white-space: nowrap; }}
+  .app-table .apply-btn:hover {{ background: #60a5fa22; }}
+  .score-chip {{ display: inline-flex; align-items: center; justify-content: center; min-width: 1.6rem; height: 1.4rem; border-radius: 5px; font-weight: 700; font-size: 0.78rem; color: #0f172a; }}
+  .status-chip {{ display: inline-block; font-size: 0.72rem; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: 600; white-space: nowrap; }}
+  .status-applied {{ background: #064e3b; color: #6ee7b7; }}
+  .status-expired {{ background: #1c1917; color: #78716c; }}
+  .status-captcha {{ background: #3b0764; color: #d8b4fe; }}
+  .status-login_issue {{ background: #450a0a; color: #fca5a5; }}
+  .status-failed {{ background: #431407; color: #fdba74; }}
+  .status-default {{ background: #1e293b; color: #94a3b8; }}
+  .fail-reason {{ color: #f87171; font-size: 0.78rem; max-width: 300px; }}
+  .empty-state {{ color: #475569; font-style: italic; padding: 2rem; text-align: center; }}
+  .stat-applied .stat-num {{ color: #6ee7b7; }}
+  .stat-failed .stat-num {{ color: #f87171; }}
+
+  .auto-apply-btn {{ background: transparent; border: 1px solid #6366f1; color: #818cf8; padding: 0.3rem 0.8rem;
+    border-radius: 6px; cursor: pointer; font-size: 0.78rem; font-weight: 600; transition: all 0.15s; white-space: nowrap; }}
+  .auto-apply-btn:hover {{ background: #6366f122; color: #a5b4fc; border-color: #a5b4fc; }}
+  .auto-apply-btn.copied {{ background: #064e3b; border-color: #10b981; color: #6ee7b7; }}
+
+  .job-card--applied {{ border-left-color: #10b981 !important; background: #0d2b1e; }}
+  .job-card--applied:hover {{ box-shadow: 0 4px 16px #10b98133; }}
+  .applied-banner {{ background: #10b981; color: #022c22; font-size: 0.75rem; font-weight: 700;
+    padding: 0.3rem 0.75rem; margin: -1rem -1rem 0.75rem -1rem; border-radius: 7px 7px 0 0;
+    letter-spacing: 0.03em; }}
+
+  .job-card--failed {{ border-left-color: #ef4444 !important; background: #1f0f0f; }}
+  .job-card--failed:hover {{ box-shadow: 0 4px 16px #ef444433; }}
+  .failed-banner {{ background: #7f1d1d; color: #fca5a5; font-size: 0.75rem; font-weight: 700;
+    padding: 0.3rem 0.75rem; margin: -1rem -1rem 0.75rem -1rem; border-radius: 7px 7px 0 0;
+    letter-spacing: 0.03em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 
   @media (max-width: 768px) {{
     .summary {{ grid-template-columns: repeat(2, 1fr); }}
@@ -309,6 +520,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
   <div class="stat-card stat-ok"><div class="stat-num">{ready}</div><div class="stat-label">Ready (desc + URL)</div></div>
   <div class="stat-card stat-scored"><div class="stat-num">{scored}</div><div class="stat-label">Scored by LLM</div></div>
   <div class="stat-card stat-high"><div class="stat-num">{high_fit}</div><div class="stat-label">Strong Fit (7+)</div></div>
+  <div class="stat-card stat-applied"><div class="stat-num">{applied_count}</div><div class="stat-label">Submitted</div></div>
+  <div class="stat-card stat-failed"><div class="stat-num">{failed_count}</div><div class="stat-label">Failed</div></div>
 </div>
 
 <div class="filters">
@@ -319,6 +532,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   <button class="filter-btn" onclick="filterScore(9)">9+ Perfect</button>
   <span class="filter-label" style="margin-left:1rem">Search:</span>
   <input type="text" class="search-input" placeholder="Filter by title, site..." oninput="filterText(this.value)">
+  <button class="filter-btn" id="hide-applied-btn" onclick="toggleHideApplied()" style="margin-left:auto">Hide Applied</button>
 </div>
 
 <div class="score-section">
@@ -332,6 +546,16 @@ def generate_dashboard(output_path: str | None = None) -> str:
   </div>
 </div>
 
+<div class="app-section">
+  <h2 style="color:#6ee7b7">Submitted Applications <span class="count-badge">{applied_count}</span></h2>
+  {applied_table_html}
+</div>
+
+<div class="app-section">
+  <h2 style="color:#f87171">Failed Applications <span class="count-badge">{failed_count}</span></h2>
+  {failed_table_html}
+</div>
+
 <div id="job-count" class="job-count"></div>
 
 {job_sections}
@@ -339,16 +563,52 @@ def generate_dashboard(output_path: str | None = None) -> str:
 <script>
 let minScore = 0;
 let searchText = '';
+let hideApplied = false;
+
+function copyApplyCmd(btn) {{
+  const cmd = btn.dataset.cmd;
+  navigator.clipboard.writeText(cmd).then(() => {{
+    btn.textContent = '✓ Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => {{
+      btn.innerHTML = '&#9654; Auto-Apply';
+      btn.classList.remove('copied');
+    }}, 2000);
+  }}).catch(() => {{
+    const ta = document.createElement('textarea');
+    ta.value = cmd;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    btn.textContent = '✓ Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => {{
+      btn.innerHTML = '&#9654; Auto-Apply';
+      btn.classList.remove('copied');
+    }}, 2000);
+  }});
+}}
 
 function filterScore(min) {{
   minScore = min;
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.filter-btn:not(#hide-applied-btn)').forEach(b => b.classList.remove('active'));
   event.target.classList.add('active');
   applyFilters();
 }}
 
 function filterText(text) {{
   searchText = text.toLowerCase();
+  applyFilters();
+}}
+
+function toggleHideApplied() {{
+  hideApplied = !hideApplied;
+  const btn = document.getElementById('hide-applied-btn');
+  btn.textContent = hideApplied ? 'Show Applied' : 'Hide Applied';
+  btn.classList.toggle('active', hideApplied);
   applyFilters();
 }}
 
@@ -361,7 +621,8 @@ function applyFilters() {{
     const text = card.textContent.toLowerCase();
     const scoreMatch = score >= (minScore || 5);
     const textMatch = !searchText || text.includes(searchText);
-    if (scoreMatch && textMatch) {{
+    const appliedMatch = !hideApplied || card.dataset.applied !== 'true';
+    if (scoreMatch && textMatch && appliedMatch) {{
       card.classList.remove('hidden');
       shown++;
     }} else {{
@@ -370,7 +631,6 @@ function applyFilters() {{
   }});
   document.getElementById('job-count').textContent = `Showing ${{shown}} of ${{total}} jobs`;
 
-  // Hide empty score groups
   document.querySelectorAll('.score-header').forEach(header => {{
     const grid = header.nextElementSibling;
     if (grid && grid.classList.contains('job-grid')) {{

@@ -16,11 +16,76 @@ from rich.table import Table
 
 from applypilot import __version__
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%H:%M:%S",
-)
+
+class _ColorFormatter(logging.Formatter):
+    """Colorize log levels for terminal output only."""
+
+    _RESET = "\033[0m"
+    _LEVEL_COLORS = {
+        logging.DEBUG: "\033[36m",
+        logging.INFO: "\033[32m",
+        logging.WARNING: "\033[33m",
+        logging.ERROR: "\033[31m",
+        logging.CRITICAL: "\033[1;31m",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        original = record.levelname
+        color = self._LEVEL_COLORS.get(record.levelno)
+        if color:
+            record.levelname = f"{color}{original}{self._RESET}"
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original
+
+
+def _parse_log_level(value: str) -> int:
+    level = getattr(logging, value.upper(), None)
+    if not isinstance(level, int):
+        raise typer.BadParameter("Choose one of: debug, info, warning, error, critical.")
+    return level
+
+
+def _configure_logging(
+    level: str = "INFO",
+    log_file: Path | None = None,
+) -> None:
+    """Set consistent logging output for CLI runs."""
+    root_level = _parse_log_level(level)
+    noisy_level = logging.INFO if root_level <= logging.DEBUG else logging.WARNING
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(root_level)
+    console_handler.setFormatter(
+        _ColorFormatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
+    )
+    logging.basicConfig(level=root_level, handlers=[console_handler], force=True)
+
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(root_level)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
+        )
+        logging.getLogger().addHandler(file_handler)
+
+    for name in (
+        "LiteLLM",
+        "LiteLLM Router",
+        "LiteLLM Proxy",
+        "litellm",
+        "httpx",
+        "httpcore",
+        "openai",
+    ):
+        noisy = logging.getLogger(name)
+        noisy.handlers.clear()
+        noisy.setLevel(noisy_level)
+        noisy.propagate = True
+
+
+_configure_logging()
 
 app = typer.Typer(
     name="applypilot",
@@ -324,7 +389,7 @@ def _run_pipeline_command(
     _validate_stage_names(stage_list)
 
     llm_stages = {"score", "tailor", "cover"}
-    if any(stage in stage_list for stage in llm_stages) or "all" in stage_list:
+    if not dry_run and (any(stage in stage_list for stage in llm_stages) or "all" in stage_list):
         _ensure_llm_provider_ready(provider)
 
     valid_modes = ("strict", "normal", "lenient")

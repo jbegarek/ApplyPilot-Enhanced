@@ -17,3 +17,18 @@
   - `python -m pytest tests/test_lensa_filters.py tests/test_lensa_pagination.py -q -p no:cacheprovider` -> pass
   - repo-local manual Python checks for `load_employers()` missing-file path and `_store_jobs()` DB writes -> pass
 - Observed sandbox limitation: pytest temp-dir fixtures fail with `PermissionError` when scanning temp roots on this Windows sandbox
+- Added failing LiteLLM-focused tests and confirmed missing `LLMClient` / `resolve_llm_config` import failures
+- Replaced `src/applypilot/llm.py` with a compatibility-oriented LiteLLM migration layer
+- Updated `.env.example`, `pyproject.toml`, and wizard AI setup for the new provider/model contract
+- Verified:
+  - `python -m pytest tests/test_llm_client.py tests/test_llm_resolution.py tests/test_cli_llm_option.py tests/test_apply_resume_state.py tests/test_init_wizard.py tests/test_wizard_ai_features.py -q -p no:cacheprovider` -> 31 passed
+  - `python -m pytest tests/discovery/test_greenhouse.py -q -p no:cacheprovider -k "not file_missing and not store_new_jobs"` -> 16 passed, 2 deselected
+  - `python -m pytest tests/test_lensa_filters.py tests/test_lensa_pagination.py -q -p no:cacheprovider` -> 12 passed
+- Added dashboard regression tests for submitted/failed application tables and optional-field handling
+- Ported HTML dashboard improvements into `src/applypilot/view.py`
+- Fixed a dry-run CLI regression so `pipeline --dry-run` skips live LLM provider readiness checks
+- Added CLI logging configuration with colorized levels and quieter SDK/network loggers
+- Added `SECURITY.md`
+- Verified:
+  - `python -m pytest tests/test_view_dashboard.py tests/test_cli_llm_option.py tests/test_cli_logging.py -q -p no:cacheprovider` -> pass
+  - `python -m pytest tests/test_apply_resume_state.py tests/test_cli_llm_option.py tests/test_lensa_filters.py tests/test_lensa_pagination.py tests/test_view_dashboard.py -q -p no:cacheprovider` -> 32 passed

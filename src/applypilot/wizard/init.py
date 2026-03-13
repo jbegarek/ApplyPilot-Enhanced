@@ -346,29 +346,112 @@ def _setup_searches() -> None:
 
 
 def _setup_ai_features() -> None:
-    """Check for Claude Code CLI - required for AI scoring/tailoring."""
+    """Collect LLM credentials and model routing for AI stages."""
     console.print(Panel(
-        "[bold]Step 4: AI Features[/bold]\n"
-        "ApplyPilot uses Claude Code CLI for job scoring, resume tailoring, and cover letters.\n"
-        "No separate API keys needed - runs on your Claude Code subscription."
+        "[bold]Step 4: AI Features (optional)[/bold]\n"
+        "ApplyPilot can use Gemini, OpenAI, Anthropic, or a local OpenAI-compatible endpoint\n"
+        "for job scoring, resume tailoring, and cover letters."
     ))
 
     existing_env = _load_existing_env()
+    if not Confirm.ask("Enable AI scoring and resume tailoring?", default=True):
+        console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
+        return
 
-    if shutil.which("claude"):
-        console.print("[green]Claude Code CLI detected - AI features are ready.[/green]")
-        model = Prompt.ask("Claude model to use", default=existing_env.get("LLM_MODEL", "sonnet"))
-        env_lines = ["# ApplyPilot configuration", "", f"LLM_MODEL={model}", ""]
-        if existing_env.get("CAPSOLVER_API_KEY"):
-            env_lines.extend([f"CAPSOLVER_API_KEY={existing_env['CAPSOLVER_API_KEY']}", ""])
-        ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
-        console.print(f"[green]Model preference saved to {ENV_PATH}[/green]")
+    console.print(
+        "Supported providers: [bold]Gemini[/bold] (recommended), OpenAI, Anthropic, "
+        "and local OpenAI-compatible endpoints."
+    )
+    console.print("[dim]Leave any field blank to keep it unset.[/dim]")
+
+    env_values = dict(existing_env)
+    configured_sources: list[str] = []
+
+    gemini_key = Prompt.ask(
+        "Gemini API key (optional, from aistudio.google.com)",
+        default=existing_env.get("GEMINI_API_KEY", ""),
+    ).strip()
+    if gemini_key:
+        env_values["GEMINI_API_KEY"] = gemini_key
+        configured_sources.append("gemini")
     else:
+        env_values.pop("GEMINI_API_KEY", None)
+
+    openai_key = Prompt.ask(
+        "OpenAI API key (optional)",
+        default=existing_env.get("OPENAI_API_KEY", ""),
+    ).strip()
+    if openai_key:
+        env_values["OPENAI_API_KEY"] = openai_key
+        configured_sources.append("openai")
+    else:
+        env_values.pop("OPENAI_API_KEY", None)
+
+    anthropic_key = Prompt.ask(
+        "Anthropic API key (optional)",
+        default=existing_env.get("ANTHROPIC_API_KEY", ""),
+    ).strip()
+    if anthropic_key:
+        env_values["ANTHROPIC_API_KEY"] = anthropic_key
+        configured_sources.append("anthropic")
+    else:
+        env_values.pop("ANTHROPIC_API_KEY", None)
+
+    local_url = Prompt.ask(
+        "Local LLM endpoint URL (optional)",
+        default=existing_env.get("LLM_URL", ""),
+    ).strip()
+    if local_url:
+        env_values["LLM_URL"] = local_url
+        configured_sources.append("local")
+    else:
+        env_values.pop("LLM_URL", None)
+
+    default_model_by_source = {
+        "gemini": "gemini/gemini-3.0-flash",
+        "openai": "openai/gpt-4o-mini",
+        "anthropic": "anthropic/claude-haiku-4-5",
+        "local": "openai/local-model",
+    }
+    existing_model = existing_env.get("LLM_MODEL", "")
+    default_model = existing_model or default_model_by_source.get(configured_sources[0], "gemini/gemini-3.0-flash")
+    model = Prompt.ask(
+        "LLM model (optional, include provider prefix)",
+        default=default_model,
+    ).strip()
+    if model:
+        env_values["LLM_MODEL"] = model
+    else:
+        env_values.pop("LLM_MODEL", None)
+
+    if not configured_sources and "LLM_MODEL" not in env_values:
+        console.print("[dim]No AI provider configured. You can add one later with [bold]applypilot init[/bold].[/dim]")
+        return
+
+    lines = ["# ApplyPilot configuration", ""]
+    for key in (
+        "GEMINI_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "LLM_URL",
+        "LLM_MODEL",
+        "LLM_MODEL_GENERAL",
+        "LLM_MODEL_TAILOR",
+        "LLM_API_KEY",
+        "CAPSOLVER_API_KEY",
+    ):
+        value = env_values.get(key)
+        if value:
+            lines.append(f"{key}={value}")
+    lines.append("")
+    ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
+
+    if len(configured_sources) > 1:
         console.print(
-            "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]\n"
-            "AI features (scoring, tailoring, cover letters) won't work until it's installed."
+            f"[yellow]Multiple LLM providers saved ({', '.join(configured_sources)}). "
+            "Runtime routing follows the provider prefix in LLM_MODEL.[/yellow]"
         )
+    console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
 
 
 # ---------------------------------------------------------------------------
