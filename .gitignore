@@ -16,6 +16,7 @@ apply_logs/
 logs/
 .playwright-cli/
 .test_tmp/
+.pytest_tmp/
 applypilot-test-*/
 pytest-cache-files-*/
 
