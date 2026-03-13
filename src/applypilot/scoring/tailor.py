@@ -20,10 +20,9 @@ from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.llm import ClaudeCLIClient, UsageLimitError, get_client, get_tailor_client
+from applypilot.llm import UsageLimitError, get_client, get_tailor_client
 from applypilot.scoring.validator import (
     BANNED_WORDS,
-    FABRICATION_WATCHLIST,
     sanitize_text,
     validate_json_fields,
     validate_tailored_resume,

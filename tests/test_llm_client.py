@@ -2,7 +2,7 @@ import os
 from types import SimpleNamespace
 
 import applypilot.llm as llm_module
-from applypilot.llm import LLMClient, LLMConfig
+from applypilot.llm import LLMClient, LLMConfig, UsageLimitError, _is_usage_limit_error
 
 
 def test_client_init_does_not_mutate_provider_env(monkeypatch) -> None:
@@ -113,3 +113,31 @@ def test_chat_sets_local_api_base_and_api_key(monkeypatch) -> None:
 
     assert captured["api_base"] == "http://127.0.0.1:8080/v1"
     assert captured["api_key"] == "local-key"
+
+
+def test_usage_limit_phrase_detects_hit_limit_variant() -> None:
+    msg = "You've hit your limit - resets 9pm (America/New_York)."
+    assert _is_usage_limit_error(msg)
+
+
+def test_chat_raises_usage_limit_error_for_quota_failures(monkeypatch) -> None:
+    client = LLMClient(
+        LLMConfig(
+            provider="anthropic",
+            api_base=None,
+            model="anthropic/claude-haiku-4-5",
+            api_key="test-key",
+        )
+    )
+
+    def _fake_completion(**_: object) -> SimpleNamespace:
+        raise RuntimeError("You've hit your limit - resets 9pm (America/New_York).")
+
+    monkeypatch.setattr(llm_module.litellm, "completion", _fake_completion)
+
+    try:
+        client.chat([{"role": "user", "content": "hello"}])
+    except UsageLimitError as exc:
+        assert "hit your limit" in exc.raw_message.lower()
+    else:
+        raise AssertionError("UsageLimitError was not raised")
