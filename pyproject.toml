@@ -22,6 +22,7 @@ dependencies = [
     "rich>=13.0",
     "httpx>=0.24",
     "beautifulsoup4>=4.12",
+    "docx2pdf>=0.1.8",
     "playwright>=1.40",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
@@ -34,6 +35,7 @@ dev = ["pytest>=7.0", "ruff>=0.1"]
 
 [project.scripts]
 applypilot = "applypilot.cli:app"
+applypilot-gui = "applypilot.gui:launch_gui"
 
 [project.urls]
 Homepage = "https://github.com/jbegarek/ApplyPilot-Enhanced"

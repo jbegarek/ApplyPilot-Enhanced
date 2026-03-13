@@ -122,7 +122,7 @@ def test_model_resolution_treats_auto_override_as_provider_default(
     monkeypatch.setenv("LLM_MODEL", "auto")
 
     with caplog.at_level("WARNING"):
-        assert llm._model("general") == "gemini-2.0-flash"
+        assert llm._model("general") == "gemini-2.5-flash-lite"
         assert llm._model("tailor") == "gemini-2.5-pro"
 
     assert "Ignoring LLM_MODEL='auto'" not in caplog.text
@@ -202,3 +202,28 @@ def test_make_client_fallback_codex_auto_uses_openai_default_model(
     client = llm._make_client("tailor")
     assert isinstance(client, llm.OpenAIClient)
     assert client.model == "gpt-4o"
+
+
+def test_tailor_client_refreshes_when_provider_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        llm.shutil,
+        "which",
+        lambda name: f"C:/bin/{name}" if name in {"claude", "gemini"} else None,
+    )
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MODEL_GENERAL", raising=False)
+    monkeypatch.delenv("LLM_MODEL_TAILOR", raising=False)
+    monkeypatch.setattr(llm, "_instance", None)
+    monkeypatch.setattr(llm, "_tailor_instance", None)
+
+    monkeypatch.setenv("LLM_PROVIDER", "claude")
+    first = llm.get_tailor_client()
+
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    second = llm.get_tailor_client()
+
+    assert isinstance(first, llm.ClaudeCLIClient)
+    assert isinstance(second, llm.GeminiCLIClient)
+    assert second.model == "gemini-2.5-pro"

@@ -1,0 +1,41 @@
+employers:
+  scaleai:
+    name: "Scale AI"
+  stripe:
+    name: "Stripe"
+  figma:
+    name: "Figma"
+  notionhq:
+    name: "Notion"
+  asana:
+    name: "Asana"
+  mongodb:
+    name: "MongoDB"
+  hashicorp:
+    name: "HashiCorp"
+  datadog:
+    name: "Datadog"
+  cloudflare:
+    name: "Cloudflare"
+  robinhood:
+    name: "Robinhood"
+  coinbase:
+    name: "Coinbase"
+  plaid:
+    name: "Plaid"
+  brex:
+    name: "Brex"
+  zapier:
+    name: "Zapier"
+  airtable:
+    name: "Airtable"
+  sentry:
+    name: "Sentry"
+  vercel:
+    name: "Vercel"
+  anduril:
+    name: "Anduril"
+  flexport:
+    name: "Flexport"
+  snowflake:
+    name: "Snowflake"

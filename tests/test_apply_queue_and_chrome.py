@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import shutil
 from pathlib import Path
 from uuid import uuid4
@@ -76,6 +77,95 @@ def test_acquire_job_prioritizes_untried_before_retries(monkeypatch) -> None:
     finally:
         close_connection(db_path)
         shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def test_acquire_job_retries_when_cached_connection_is_readonly(monkeypatch) -> None:
+    events: list[str] = []
+    row = {
+        "url": "https://example.com/job",
+        "title": "Example Job",
+        "site": "Example",
+        "application_url": "https://example.com/job",
+        "tailored_resume_path": "C:/tmp/resume.txt",
+        "fit_score": 8,
+        "location": "Remote",
+        "full_description": "Example description",
+        "cover_letter_path": None,
+    }
+
+    class _Cursor:
+        def __init__(self, result):
+            self._result = result
+
+        def fetchone(self):
+            return self._result
+
+    class _ReadonlyConn:
+        def execute(self, sql, params=()):
+            _ = params
+            if sql == "BEGIN IMMEDIATE":
+                events.append("readonly:begin")
+                return _Cursor(None)
+            if "SELECT url, title, site, application_url" in sql:
+                events.append("readonly:select")
+                return _Cursor(row)
+            if "UPDATE jobs SET apply_status = 'in_progress'" in sql:
+                events.append("readonly:update")
+                raise sqlite3.OperationalError("attempt to write a readonly database")
+            raise AssertionError(f"unexpected SQL on readonly conn: {sql}")
+
+        def rollback(self):
+            events.append("readonly:rollback")
+
+    class _WritableConn:
+        def execute(self, sql, params=()):
+            _ = params
+            if sql == "BEGIN IMMEDIATE":
+                events.append("writable:begin")
+                return _Cursor(None)
+            if "SELECT url, title, site, application_url" in sql:
+                events.append("writable:select")
+                return _Cursor(row)
+            if "UPDATE jobs SET apply_status = 'in_progress'" in sql:
+                events.append("writable:update")
+                return _Cursor(None)
+            raise AssertionError(f"unexpected SQL on writable conn: {sql}")
+
+        def commit(self):
+            events.append("writable:commit")
+
+        def rollback(self):
+            events.append("writable:rollback")
+
+    readonly_conn = _ReadonlyConn()
+    writable_conn = _WritableConn()
+    next_conn = {"count": 0}
+
+    def fake_get_connection():
+        next_conn["count"] += 1
+        return readonly_conn if next_conn["count"] == 1 else writable_conn
+
+    close_calls: list[str] = []
+
+    monkeypatch.setattr(launcher, "get_connection", fake_get_connection)
+    monkeypatch.setattr(launcher, "close_connection", lambda: close_calls.append("closed"))
+    monkeypatch.setattr(launcher, "_load_blocked", lambda: ([], []))
+
+    job = launcher.acquire_job(min_score=7, worker_id=3)
+
+    assert job is not None
+    assert job["url"] == row["url"]
+    assert close_calls == ["closed"]
+    assert events == [
+        "readonly:begin",
+        "readonly:select",
+        "readonly:update",
+        "readonly:rollback",
+        "writable:begin",
+        "writable:select",
+        "writable:update",
+        "writable:commit",
+    ]
 
 
 def test_remove_expired_deletes_expired_jobs(monkeypatch) -> None:

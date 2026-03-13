@@ -1,0 +1,32 @@
+# Findings
+
+- Issue `bincat233/ApplyPilot-Plus#1` was created on 2026-03-12 and updated on 2026-03-13.
+- Local baseline SHA: `285e87c710ad164efcd1723330eb43559fc4252b`
+- Comparison target SHA (`comparetarget/main`): `44e3cb342cc761e9c96f81e141f43aa15c952c89`
+- The issue explicitly lists a set of improvements adopted from `jbegarek/ApplyPilot-Enhanced`, mainly around Lensa discovery, CLI utilities, enrichment visibility/reset options, Chrome profile/CDP handling, and apply queue fixes.
+- Compared against local `HEAD` (`285e87c` on 2026-03-10), `comparetarget/main` (`44e3cb3` on 2026-03-13) contains many additional commits not in the local branch.
+- Distinct capabilities present in `comparetarget/main` and absent locally include:
+  - Greenhouse ATS discovery and employer registry
+  - LiteLLM migration/provider refactor
+  - dashboard rendering hardening and extra HTML dashboard states
+  - `SECURITY.md`
+  - logging cleanup/colorized log levels
+  - tailored resume JSON/PDF artifact flow refinements
+- Local-only work not present in `comparetarget/main` includes desktop GUI files and ready-jobs export work.
+- User selected a capability-first back-merge plan rather than a full direct merge.
+- Priority order approved:
+  - Tier 1: Greenhouse ATS support, LiteLLM migration
+  - Tier 2: dashboard improvements, logging cleanup, artifact-flow refinements
+  - Tier 3: `SECURITY.md` and selective docs
+- Design doc saved to `docs/plans/2026-03-13-applypilot-plus-backmerge-design.md`.
+- Execution plan saved to `docs/plans/2026-03-13-applypilot-plus-backmerge.md`.
+- Greenhouse implementation landed locally with:
+  - new module `src/applypilot/discovery/greenhouse.py`
+  - new config `src/applypilot/config/greenhouse.yaml`
+  - new CLI subcommand module `src/applypilot/cli_greenhouse/__init__.py`
+  - pipeline wiring in `src/applypilot/pipeline.py`
+  - CLI registration in `src/applypilot/cli.py`
+- Verification status for Greenhouse:
+  - `tests/discovery/test_greenhouse.py`: 16 passing tests plus 2 environment-blocked temp-path tests under sandboxed Windows permissions
+  - `tests/test_lensa_filters.py` and `tests/test_lensa_pagination.py`: passing after Greenhouse integration
+  - manual checks confirmed `load_employers()` missing-file behavior and `_store_jobs()` database writes

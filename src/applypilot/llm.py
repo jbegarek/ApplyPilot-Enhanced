@@ -683,26 +683,32 @@ def _make_client(tier: str = "general"):
 # ---------------------------------------------------------------------------
 
 _instance = None
+_instance_key: tuple[str, str] | None = None
 _tailor_instance = None
+_tailor_instance_key: tuple[str, str] | None = None
 
 
 def get_client():
     """Return the module-level LLM client singleton (general tier)."""
-    global _instance
-    if _instance is None:
-        prov = _provider()
-        model = _model("general")
+    global _instance, _instance_key
+    prov = _provider()
+    model = _model("general")
+    key = (prov, model)
+    if _instance is None or _instance_key != key:
         log.info("LLM provider: %s  model: %s", prov, model)
         _instance = _make_client("general")
+        _instance_key = key
     return _instance
 
 
 def get_tailor_client():
     """Return a dedicated high-quality client for the tailoring stage."""
-    global _tailor_instance
-    if _tailor_instance is None:
-        prov = _provider()
-        model = _model("tailor")
+    global _tailor_instance, _tailor_instance_key
+    prov = _provider()
+    model = _model("tailor")
+    key = (prov, model)
+    if _tailor_instance is None or _tailor_instance_key != key:
         log.info("Tailor LLM: %s  model: %s", prov, model)
         _tailor_instance = _make_client("tailor")
+        _tailor_instance_key = key
     return _tailor_instance

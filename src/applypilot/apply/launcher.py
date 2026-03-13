@@ -11,6 +11,7 @@ import logging
 import os
 import platform
 import re
+import sqlite3
 import signal
 import subprocess
 import sys
@@ -24,7 +25,7 @@ from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
-from applypilot.database import get_connection
+from applypilot.database import close_connection, get_connection
 from applypilot.llm import UsageLimitError, _is_usage_limit_error
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
 from applypilot.apply.chrome import (
@@ -39,6 +40,28 @@ from applypilot.apply.dashboard import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_readonly_db_error(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "readonly" in str(exc).lower()
+
+
+def _run_write_with_retry(operation):
+    """Retry once with a fresh SQLite connection if a cached handle turns readonly."""
+    for attempt in range(2):
+        conn = get_connection()
+        try:
+            return operation(conn)
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            if attempt == 0 and _is_readonly_db_error(exc):
+                logger.warning("SQLite connection became readonly; reopening cached handle and retrying once.")
+                close_connection()
+                continue
+            raise
 
 # Blocked sites loaded from config/sites.yaml
 def _load_blocked():
@@ -105,8 +128,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     Returns:
         Job dict or None if the queue is empty.
     """
-    conn = get_connection()
-    try:
+    def _operation(conn):
         conn.execute("BEGIN IMMEDIATE")
 
         if target_url:
@@ -177,43 +199,45 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         conn.commit()
 
         return dict(row)
-    except Exception:
-        conn.rollback()
-        raise
+    return _run_write_with_retry(_operation)
 
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
                 task_id: str | None = None) -> None:
     """Update a job's apply status in the database."""
-    conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
-    if status == "applied":
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ?
-        """, (now, duration_ms, task_id, url))
-    else:
-        attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
-        conn.execute(f"""
-            UPDATE jobs SET apply_status = ?, apply_error = ?,
-                           apply_attempts = {attempts}, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ?
-        """, (status, error or "unknown", duration_ms, task_id, url))
-    conn.commit()
+    def _operation(conn):
+        now = datetime.now(timezone.utc).isoformat()
+        if status == "applied":
+            conn.execute("""
+                UPDATE jobs SET apply_status = 'applied', applied_at = ?,
+                               apply_error = NULL, agent_id = NULL,
+                               apply_duration_ms = ?, apply_task_id = ?
+                WHERE url = ?
+            """, (now, duration_ms, task_id, url))
+        else:
+            attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
+            conn.execute(f"""
+                UPDATE jobs SET apply_status = ?, apply_error = ?,
+                               apply_attempts = {attempts}, agent_id = NULL,
+                               apply_duration_ms = ?, apply_task_id = ?
+                WHERE url = ?
+            """, (status, error or "unknown", duration_ms, task_id, url))
+        conn.commit()
+
+    _run_write_with_retry(_operation)
 
 
 def release_lock(url: str) -> None:
     """Release the in_progress lock without changing status."""
-    conn = get_connection()
-    conn.execute(
-        "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
-        (url,),
-    )
-    conn.commit()
+    def _operation(conn):
+        conn.execute(
+            "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
+            (url,),
+        )
+        conn.commit()
+
+    _run_write_with_retry(_operation)
 
 
 # ---------------------------------------------------------------------------
@@ -265,21 +289,23 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
         status: Either 'applied' or 'failed'.
         reason: Failure reason (only for status='failed').
     """
-    conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
-    if status == "applied":
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL
-            WHERE url = ?
-        """, (now, url))
-    else:
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'failed', apply_error = ?,
-                           apply_attempts = 99, agent_id = NULL
-            WHERE url = ?
-        """, (reason or "manual", url))
-    conn.commit()
+    def _operation(conn):
+        now = datetime.now(timezone.utc).isoformat()
+        if status == "applied":
+            conn.execute("""
+                UPDATE jobs SET apply_status = 'applied', applied_at = ?,
+                               apply_error = NULL, agent_id = NULL
+                WHERE url = ?
+            """, (now, url))
+        else:
+            conn.execute("""
+                UPDATE jobs SET apply_status = 'failed', apply_error = ?,
+                               apply_attempts = 99, agent_id = NULL
+                WHERE url = ?
+            """, (reason or "manual", url))
+        conn.commit()
+
+    _run_write_with_retry(_operation)
 
 
 def reset_failed() -> int:
@@ -288,16 +314,18 @@ def reset_failed() -> int:
     Returns:
         Number of jobs reset.
     """
-    conn = get_connection()
-    cursor = conn.execute("""
-        UPDATE jobs SET apply_status = NULL, apply_error = NULL,
-                       apply_attempts = 0, agent_id = NULL
-        WHERE apply_status = 'failed'
-          OR (apply_status IS NOT NULL AND apply_status != 'applied'
-              AND apply_status != 'in_progress')
-    """)
-    conn.commit()
-    return cursor.rowcount
+    def _operation(conn):
+        cursor = conn.execute("""
+            UPDATE jobs SET apply_status = NULL, apply_error = NULL,
+                           apply_attempts = 0, agent_id = NULL
+            WHERE apply_status = 'failed'
+              OR (apply_status IS NOT NULL AND apply_status != 'applied'
+                  AND apply_status != 'in_progress')
+        """)
+        conn.commit()
+        return cursor.rowcount
+
+    return _run_write_with_retry(_operation)
 
 
 def remove_expired() -> int:
@@ -310,16 +338,18 @@ def remove_expired() -> int:
     Returns:
         Number of jobs removed.
     """
-    conn = get_connection()
-    cursor = conn.execute(
-        """
-        DELETE FROM jobs
-        WHERE LOWER(COALESCE(apply_status, '')) = 'expired'
-           OR LOWER(COALESCE(apply_error, '')) LIKE 'expired%'
-        """
-    )
-    conn.commit()
-    return cursor.rowcount
+    def _operation(conn):
+        cursor = conn.execute(
+            """
+            DELETE FROM jobs
+            WHERE LOWER(COALESCE(apply_status, '')) = 'expired'
+               OR LOWER(COALESCE(apply_error, '')) LIKE 'expired%'
+            """
+        )
+        conn.commit()
+        return cursor.rowcount
+
+    return _run_write_with_retry(_operation)
 
 
 def reset_in_progress() -> int:
@@ -328,16 +358,18 @@ def reset_in_progress() -> int:
     Returns:
         Number of rows unlocked.
     """
-    conn = get_connection()
-    cursor = conn.execute(
-        """
-        UPDATE jobs
-        SET apply_status = NULL, agent_id = NULL
-        WHERE apply_status = 'in_progress'
-        """
-    )
-    conn.commit()
-    return cursor.rowcount
+    def _operation(conn):
+        cursor = conn.execute(
+            """
+            UPDATE jobs
+            SET apply_status = NULL, agent_id = NULL
+            WHERE apply_status = 'in_progress'
+            """
+        )
+        conn.commit()
+        return cursor.rowcount
+
+    return _run_write_with_retry(_operation)
 
 
 # ---------------------------------------------------------------------------

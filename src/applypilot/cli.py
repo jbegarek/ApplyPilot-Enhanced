@@ -60,10 +60,24 @@ def _bootstrap() -> None:
     init_db()
 
 
-def _show_usage_limit_exit(reset_at: str | None = None) -> None:
+def _show_usage_limit_exit(
+    reset_at: str | None = None,
+    *,
+    stage: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> None:
     """Display a rich panel when usage limit is hit and exit."""
+    from applypilot.llm import _model
+
     now = datetime.now(timezone.utc)
     now_local = datetime.now()
+    active_provider = (provider or os.environ.get("LLM_PROVIDER", "claude")).lower()
+    active_model = model
+    if active_model is None:
+        tier = "tailor" if stage == "tailor" else "general"
+        active_model = _model(tier)
+    provider_label = active_provider.capitalize()
 
     # Format the reset time for display
     if reset_at:
@@ -84,13 +98,14 @@ def _show_usage_limit_exit(reset_at: str | None = None) -> None:
             reset_display = "Unknown"
             time_remaining = "Unknown"
     else:
-        reset_display = "Unknown (check your Claude subscription)"
+        reset_display = f"Unknown (check your {provider_label} quota or CLI access)"
         time_remaining = "Unknown"
 
     current_time = now_local.strftime("%Y-%m-%d %I:%M %p %Z")
 
     message = (
-        f"[bold red]Claude API usage limit reached.[/bold red]\n\n"
+        f"[bold red]{provider_label} usage limit reached.[/bold red]\n"
+        f"  Active model:         {active_model}\n\n"
         f"  Session paused:       {current_time}\n"
         f"  Usage refreshes at:   [bold cyan]{reset_display}[/bold cyan]\n"
         f"  Time remaining:       {time_remaining}\n\n"
@@ -332,7 +347,10 @@ def _run_pipeline_command(
     )
 
     if result.get("usage_limit"):
-        _show_usage_limit_exit(result.get("reset_at"))
+        _show_usage_limit_exit(
+            result.get("reset_at"),
+            stage=result.get("usage_limit_stage"),
+        )
         raise typer.Exit(code=2)
 
     if result.get("errors"):
@@ -561,6 +579,14 @@ def init() -> None:
     from applypilot.wizard.init import run_wizard
 
     run_wizard()
+
+
+@app.command()
+def gui() -> None:
+    """Launch the Windows desktop GUI."""
+    from applypilot.gui import launch_gui
+
+    launch_gui()
 
 
 @pipeline_app.callback(invoke_without_command=True)
@@ -1007,7 +1033,12 @@ def apply(
             reason="usage_limit",
             reset_at=reset_at,
         )
-        _show_usage_limit_exit(reset_at)
+        _show_usage_limit_exit(
+            reset_at,
+            stage="apply",
+            provider=provider,
+            model=effective_model or "haiku",
+        )
         raise typer.Exit(code=2)
 
 
@@ -1076,7 +1107,10 @@ def resume(
         )
 
         if result.get("usage_limit"):
-            _show_usage_limit_exit(result.get("reset_at"))
+            _show_usage_limit_exit(
+                result.get("reset_at"),
+                stage=result.get("usage_limit_stage"),
+            )
             raise typer.Exit(code=2)
 
         if result.get("errors"):
@@ -1147,7 +1181,12 @@ def resume(
                 reason="usage_limit",
                 reset_at=reset_at,
             )
-            _show_usage_limit_exit(reset_at)
+            _show_usage_limit_exit(
+                reset_at,
+                stage="apply",
+                provider=os.environ.get("LLM_PROVIDER"),
+                model=apply_args["model"],
+            )
             raise typer.Exit(code=2)
     else:
         console.print(f"[red]Unknown saved command:[/red] '{command}'")
@@ -1401,6 +1440,11 @@ def doctor() -> None:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Chrome + Node.js)[/dim]")
 
     console.print()
+
+
+from applypilot.cli_greenhouse import app as greenhouse_app
+
+app.add_typer(greenhouse_app, name="greenhouse", help="Manage Greenhouse ATS employers")
 
 
 if __name__ == "__main__":

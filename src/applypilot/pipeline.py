@@ -64,12 +64,17 @@ _UPSTREAM: dict[str, str | None] = {
 
 def _run_discover(workers: int = 1, site_filter: list[str] | None = None) -> dict:
     """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
+    stats: dict = {"jobspy": None, "workday": None, "smartextract": None, "greenhouse": None}
 
     if site_filter:
         filters = [s.strip().lower() for s in site_filter if s and s.strip()]
         if not filters:
-            return {"jobspy": "skipped (site-filter)", "workday": "skipped (site-filter)", "smartextract": "error: empty site-filter"}
+            return {
+                "jobspy": "skipped (site-filter)",
+                "workday": "skipped (site-filter)",
+                "smartextract": "error: empty site-filter",
+                "greenhouse": "skipped (site-filter)",
+            }
 
         console.print(f"  [cyan]Smart extract (filtered sites): {', '.join(site_filter)}[/cyan]")
         try:
@@ -98,12 +103,14 @@ def _run_discover(workers: int = 1, site_filter: list[str] | None = None) -> dic
             stats["jobspy"] = "skipped (site-filter)"
             stats["workday"] = "skipped (site-filter)"
             stats["smartextract"] = "ok"
+            stats["greenhouse"] = "skipped (site-filter)"
         except Exception as e:
             log.error("Smart extract (filtered) failed: %s", e)
             console.print(f"  [red]Smart extract error:[/red] {e}")
             stats["jobspy"] = "skipped (site-filter)"
             stats["workday"] = "skipped (site-filter)"
             stats["smartextract"] = f"error: {e}"
+            stats["greenhouse"] = "skipped (site-filter)"
         return stats
 
     # JobSpy
@@ -138,6 +145,17 @@ def _run_discover(workers: int = 1, site_filter: list[str] | None = None) -> dic
         log.error("Smart extract failed: %s", e)
         console.print(f"  [red]Smart extract error:[/red] {e}")
         stats["smartextract"] = f"error: {e}"
+
+    console.print("  [cyan]Greenhouse ATS scraper...[/cyan]")
+    try:
+        from applypilot.discovery.greenhouse import search_all
+
+        new, existing = search_all("", workers=workers)
+        stats["greenhouse"] = f"ok ({new} new, {existing} existing)"
+    except Exception as e:
+        log.error("Greenhouse scraper failed: %s", e)
+        console.print(f"  [red]Greenhouse error:[/red] {e}")
+        stats["greenhouse"] = f"error: {e}"
 
     return stats
 
@@ -458,6 +476,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                 "errors": errors,
                 "elapsed": total_elapsed,
                 "usage_limit": True,
+                "usage_limit_stage": name,
                 "reset_at": reset_at,
                 "remaining_stages": remaining,
             }
@@ -587,6 +606,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
             reset_at=reset_at,
         )
         result["usage_limit"] = True
+        result["usage_limit_stage"] = usage_limit_info.get("stage")
         result["reset_at"] = reset_at
 
     return result

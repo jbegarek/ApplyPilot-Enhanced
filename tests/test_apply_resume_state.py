@@ -99,7 +99,7 @@ def test_resume_apply_saves_session_on_usage_limit(monkeypatch: pytest.MonkeyPat
     }
 
     monkeypatch.setattr(cli, "_bootstrap", lambda: None)
-    monkeypatch.setattr(cli, "_show_usage_limit_exit", lambda _reset: None)
+    monkeypatch.setattr(cli, "_show_usage_limit_exit", lambda _reset, **_kwargs: None)
 
     import applypilot.session as session_mod
     import applypilot.apply.launcher as launcher_mod

@@ -266,3 +266,27 @@ def test_help_command_shows_current_apply_flags() -> None:
     assert "--headless" in result.output
     assert "--close-all-chrome" in result.output
     assert "--url" in result.output
+
+
+def test_usage_limit_panel_uses_active_provider_and_tailor_model(
+    monkeypatch,
+) -> None:
+    captured: list[object] = []
+
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MODEL_GENERAL", raising=False)
+    monkeypatch.delenv("LLM_MODEL_TAILOR", raising=False)
+    monkeypatch.setattr(
+        cli.console,
+        "print",
+        lambda *args, **kwargs: captured.append(args[0]) if args else None,
+    )
+
+    cli._show_usage_limit_exit(stage="tailor")
+
+    panel = next(item for item in captured if item.__class__.__name__ == "Panel")
+    message = str(panel.renderable)
+
+    assert "Gemini usage limit reached" in message
+    assert "gemini-2.5-pro" in message
