@@ -13,6 +13,7 @@ Usage (via CLI):
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime
@@ -22,7 +23,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from applypilot.config import load_env, ensure_dirs
-from applypilot.database import init_db, get_connection, get_stats
+from applypilot.database import count_pending_pdf, init_db, get_connection, get_stats
 from applypilot.llm import UsageLimitError
 from applypilot.session import save_session, estimate_reset_time
 
@@ -61,9 +62,56 @@ _UPSTREAM: dict[str, str | None] = {
 # Individual stage runners
 # ---------------------------------------------------------------------------
 
-def _run_discover(workers: int = 1) -> dict:
+def _run_discover(workers: int = 1, site_filter: list[str] | None = None) -> dict:
     """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
+    stats: dict = {"jobspy": None, "workday": None, "smartextract": None, "greenhouse": None}
+
+    if site_filter:
+        filters = [s.strip().lower() for s in site_filter if s and s.strip()]
+        if not filters:
+            return {
+                "jobspy": "skipped (site-filter)",
+                "workday": "skipped (site-filter)",
+                "smartextract": "error: empty site-filter",
+                "greenhouse": "skipped (site-filter)",
+            }
+
+        console.print(f"  [cyan]Smart extract (filtered sites): {', '.join(site_filter)}[/cyan]")
+        try:
+            from applypilot.discovery.smartextract import load_sites, run_smart_extract
+
+            configured_sites = load_sites()
+            matched_sites: list[dict] = []
+            seen_names: set[str] = set()
+            for site in configured_sites:
+                name = str(site.get("name", "")).strip()
+                if not name:
+                    continue
+                name_lower = name.lower()
+                if any(f == name_lower or f in name_lower for f in filters):
+                    if name_lower not in seen_names:
+                        matched_sites.append(site)
+                        seen_names.add(name_lower)
+
+            if not matched_sites:
+                available = ", ".join(sorted({str(s.get("name", "")).strip() for s in configured_sites if s.get("name")})) or "none"
+                raise ValueError(
+                    f"No sites matched site-filter={site_filter}. Available sites: {available}"
+                )
+
+            run_smart_extract(sites=matched_sites, workers=workers)
+            stats["jobspy"] = "skipped (site-filter)"
+            stats["workday"] = "skipped (site-filter)"
+            stats["smartextract"] = "ok"
+            stats["greenhouse"] = "skipped (site-filter)"
+        except Exception as e:
+            log.error("Smart extract (filtered) failed: %s", e)
+            console.print(f"  [red]Smart extract error:[/red] {e}")
+            stats["jobspy"] = "skipped (site-filter)"
+            stats["workday"] = "skipped (site-filter)"
+            stats["smartextract"] = f"error: {e}"
+            stats["greenhouse"] = "skipped (site-filter)"
+        return stats
 
     # JobSpy
     console.print("  [cyan]JobSpy full crawl...[/cyan]")
@@ -98,14 +146,25 @@ def _run_discover(workers: int = 1) -> dict:
         console.print(f"  [red]Smart extract error:[/red] {e}")
         stats["smartextract"] = f"error: {e}"
 
+    console.print("  [cyan]Greenhouse ATS scraper...[/cyan]")
+    try:
+        from applypilot.discovery.greenhouse import search_all
+
+        new, existing = search_all("", workers=workers)
+        stats["greenhouse"] = f"ok ({new} new, {existing} existing)"
+    except Exception as e:
+        log.error("Greenhouse scraper failed: %s", e)
+        console.print(f"  [red]Greenhouse error:[/red] {e}")
+        stats["greenhouse"] = f"error: {e}"
+
     return stats
 
 
-def _run_enrich(workers: int = 1) -> dict:
+def _run_enrich(workers: int = 1, headless: bool = True) -> dict:
     """Stage: Detail enrichment — scrape full descriptions and apply URLs."""
     try:
         from applypilot.enrichment.detail import run_enrichment
-        run_enrichment(workers=workers)
+        run_enrichment(workers=workers, headless=headless)
         return {"status": "ok"}
     except Exception as e:
         log.error("Enrichment failed: %s", e)
@@ -121,7 +180,8 @@ def _run_score() -> dict:
     except UsageLimitError:
         raise
     except Exception as e:
-        log.error("Scoring failed: %s", e)
+        import traceback
+        log.error("Scoring failed: %s\n%s", e, traceback.format_exc())
         return {"status": f"error: {e}"}
 
 
@@ -254,6 +314,9 @@ _STREAM_POLL_INTERVAL = 10
 
 def _count_pending(stage: str, min_score: int = 7) -> int:
     """Count pending work items for a stage."""
+    if stage == "pdf":
+        return count_pending_pdf()
+
     sql = _PENDING_SQL.get(stage)
     if sql is None:
         return 0
@@ -270,6 +333,8 @@ def _run_stage_streaming(
     min_score: int = 7,
     workers: int = 1,
     validation_mode: str = "normal",
+    headless: bool = True,
+    site_filter: list[str] | None = None,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -284,6 +349,10 @@ def _run_stage_streaming(
         kwargs["validation_mode"] = validation_mode
     if stage in ("discover", "enrich"):
         kwargs["workers"] = workers
+    if stage == "discover":
+        kwargs["site_filter"] = site_filter
+    if stage == "enrich":
+        kwargs["headless"] = headless
 
     upstream = _UPSTREAM[stage]
 
@@ -334,7 +403,8 @@ def _run_stage_streaming(
 # ---------------------------------------------------------------------------
 
 def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
-                    validation_mode: str = "normal") -> dict:
+                    validation_mode: str = "normal", headless: bool = True,
+                    site_filter: list[str] | None = None) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
@@ -357,6 +427,10 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                 kwargs["validation_mode"] = validation_mode
             if name in ("discover", "enrich"):
                 kwargs["workers"] = workers
+            if name == "discover":
+                kwargs["site_filter"] = site_filter
+            if name == "enrich":
+                kwargs["headless"] = headless
             result = runner(**kwargs)
             elapsed = time.time() - t0
 
@@ -386,6 +460,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                     "min_score": min_score,
                     "workers": workers,
                     "validation_mode": validation_mode,
+                    "site_filter": site_filter,
+                    "llm_provider": os.environ.get("LLM_PROVIDER", "claude").lower(),
                 },
                 remaining_stages=remaining,
                 reason="usage_limit",
@@ -400,6 +476,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                 "errors": errors,
                 "elapsed": total_elapsed,
                 "usage_limit": True,
+                "usage_limit_stage": name,
                 "reset_at": reset_at,
                 "remaining_stages": remaining,
             }
@@ -421,7 +498,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
 
 def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
-                   validation_mode: str = "normal") -> dict:
+                   validation_mode: str = "normal", headless: bool = True,
+                   site_filter: list[str] | None = None) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -439,7 +517,16 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
     def _streaming_wrapper(name: str) -> None:
         """Wrapper that catches UsageLimitError in streaming threads."""
         try:
-            _run_stage_streaming(name, tracker, stop_event, min_score, workers, validation_mode)
+            _run_stage_streaming(
+                name,
+                tracker,
+                stop_event,
+                min_score,
+                workers,
+                validation_mode,
+                headless=headless,
+                site_filter=site_filter,
+            )
         except UsageLimitError as ule:
             nonlocal usage_limit_info
             usage_limit_info = {
@@ -511,12 +598,15 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
                 "workers": workers,
                 "validation_mode": validation_mode,
                 "stream": True,
+                "site_filter": site_filter,
+                "llm_provider": os.environ.get("LLM_PROVIDER", "claude").lower(),
             },
             remaining_stages=ordered,
             reason="usage_limit",
             reset_at=reset_at,
         )
         result["usage_limit"] = True
+        result["usage_limit_stage"] = usage_limit_info.get("stage")
         result["reset_at"] = reset_at
 
     return result
@@ -529,6 +619,8 @@ def run_pipeline(
     stream: bool = False,
     workers: int = 1,
     validation_mode: str = "normal",
+    headless: bool = True,
+    site_filter: list[str] | None = None,
 ) -> dict:
     """Run pipeline stages.
 
@@ -538,6 +630,7 @@ def run_pipeline(
         dry_run: If True, preview stages without executing.
         stream: If True, run stages concurrently (streaming mode).
         workers: Number of parallel threads for discovery/enrichment stages.
+        headless: If False, show the browser window during enrichment scraping.
 
     Returns:
         Dict with keys: stages (list of result dicts), errors (dict), elapsed (float).
@@ -562,6 +655,8 @@ def run_pipeline(
     console.print(f"  Min score:  {min_score}")
     console.print(f"  Workers:    {workers}")
     console.print(f"  Validation: {validation_mode}")
+    if site_filter:
+        console.print(f"  Site filter: {', '.join(site_filter)}")
     console.print(f"  Stages:     {' -> '.join(ordered)}")
 
     # Pre-run stats
@@ -588,10 +683,12 @@ def run_pipeline(
     # Execute
     if stream:
         result = _run_streaming(ordered, min_score, workers=workers,
-                                validation_mode=validation_mode)
+                                validation_mode=validation_mode, headless=headless,
+                                site_filter=site_filter)
     else:
         result = _run_sequential(ordered, min_score, workers=workers,
-                                 validation_mode=validation_mode)
+                                 validation_mode=validation_mode, headless=headless,
+                                 site_filter=site_filter)
 
     # Summary table
     console.print(f"\n{'=' * 70}")

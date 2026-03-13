@@ -54,12 +54,17 @@ def _load_base_urls() -> dict[str, str | None]:
     return load_base_urls()
 
 
+def _is_absolute_http_url(url: str | None) -> bool:
+    """Return True when URL is an absolute http(s) URL."""
+    return bool(url) and (url.startswith("http://") or url.startswith("https://"))
+
+
 def resolve_url(raw_url: str, site: str) -> str | None:
     """Resolve a stored URL to an absolute URL."""
     if not raw_url:
         return None
 
-    if raw_url.startswith("http://") or raw_url.startswith("https://"):
+    if _is_absolute_http_url(raw_url):
         return raw_url
 
     if site == "WelcomeToTheJungle":
@@ -81,16 +86,25 @@ def resolve_url(raw_url: str, site: str) -> str | None:
     return urljoin(base, raw_url)
 
 
-def resolve_all_urls(conn: sqlite3.Connection) -> dict:
-    """Resolve all relative URLs in the database. Returns stats."""
-    rows = conn.execute("SELECT url, site FROM jobs").fetchall()
+def resolve_all_urls(conn: sqlite3.Connection, mark_unresolvable: bool = False) -> dict:
+    """Resolve all relative URLs in the database. Returns stats.
+
+    Args:
+        conn: SQLite connection.
+        mark_unresolvable: If True, pending jobs with URLs that cannot be
+            resolved are marked with detail_error/detail_scraped_at so they
+            don't keep failing at page navigation time.
+    """
+    rows = conn.execute("SELECT url, site, detail_scraped_at FROM jobs").fetchall()
     resolved = 0
     failed = 0
     already_absolute = 0
+    marked_invalid = 0
+    marked_at = datetime.now(timezone.utc).isoformat() if mark_unresolvable else None
 
     for row in rows:
-        url, site = row[0], row[1]
-        if url.startswith("http://") or url.startswith("https://"):
+        url, site, detail_scraped_at = row[0], row[1], row[2]
+        if _is_absolute_http_url(url):
             already_absolute += 1
             continue
 
@@ -104,6 +118,14 @@ def resolve_all_urls(conn: sqlite3.Connection) -> dict:
                 resolved += 1
         else:
             failed += 1
+            if mark_unresolvable and detail_scraped_at is None:
+                unresolved = (url or "<empty>").strip()
+                detail_error = f"invalid detail URL (unresolved): {unresolved}"[:200]
+                conn.execute(
+                    "UPDATE jobs SET detail_error = ?, detail_scraped_at = ? WHERE url = ?",
+                    (detail_error, marked_at, url),
+                )
+                marked_invalid += 1
 
     # Also resolve relative application_urls
     app_resolved = 0
@@ -121,7 +143,7 @@ def resolve_all_urls(conn: sqlite3.Connection) -> dict:
 
     conn.commit()
     return {"resolved": resolved, "failed": failed, "already_absolute": already_absolute,
-            "app_resolved": app_resolved}
+            "app_resolved": app_resolved, "marked_invalid": marked_invalid}
 
 
 def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
@@ -524,6 +546,9 @@ SITE_DELAYS = {
     "CareerJet Canada": 3.0,
     "Hacker News Jobs": 1.0,
     "BuiltIn Remote": 2.0,
+    # Rate-limited / bot-protected sites
+    "Dice": 8.0,        # hits per-IP rate limit after ~5 fast requests
+    "SimplyHired": 6.0, # Cloudflare protection; delays reduce 429s but won't bypass JS challenges
 }
 
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
@@ -614,6 +639,7 @@ def scrape_site_batch(
     jobs: list[tuple],
     delay: float = 2.0,
     max_jobs: int | None = None,
+    headless: bool = True,
 ) -> dict:
     """Process all jobs for one site using shared browser context.
 
@@ -635,7 +661,7 @@ def scrape_site_batch(
 
     try:
         with sync_playwright() as p:
-            launch_opts: dict = {"headless": True}
+            launch_opts: dict = {"headless": headless}
             if _PROXY_CONFIG:
                 launch_opts["proxy"] = _PROXY_CONFIG["playwright"]
             browser = p.chromium.launch(**launch_opts)
@@ -695,6 +721,7 @@ def _run_detail_scraper(
     sites: list[str] | None = None,
     max_per_site: int | None = None,
     workers: int = 1,
+    headless: bool = True,
 ) -> dict:
     """Groups pending jobs by site and processes each batch.
 
@@ -747,7 +774,7 @@ def _run_detail_scraper(
             jobs = site_jobs[site]
             delay = SITE_DELAYS.get(site, 2.0)
             log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
-            stats = scrape_site_batch(None, site, jobs, delay=delay, max_jobs=max_per_site)
+            stats = scrape_site_batch(None, site, jobs, delay=delay, max_jobs=max_per_site, headless=headless)
             log.info("%s summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
                      site, stats["ok"], stats["partial"], stats["error"],
                      stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
@@ -764,7 +791,7 @@ def _run_detail_scraper(
             delay = SITE_DELAYS.get(site, 2.0)
             log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
 
-            stats = scrape_site_batch(conn, site, jobs, delay=delay, max_jobs=max_per_site)
+            stats = scrape_site_batch(conn, site, jobs, delay=delay, max_jobs=max_per_site, headless=headless)
             _merge_stats(stats)
 
             log.info("Site summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
@@ -806,9 +833,10 @@ def stream_detail(
 
     conn = init_db()
 
-    url_stats = resolve_all_urls(conn)
-    log.info("URL resolution: %d resolved, %d absolute",
-             url_stats['resolved'], url_stats['already_absolute'])
+    url_stats = resolve_all_urls(conn, mark_unresolvable=True)
+    log.info("URL resolution: %d resolved, %d absolute, %d failed, %d marked invalid",
+             url_stats['resolved'], url_stats['already_absolute'],
+             url_stats['failed'], url_stats['marked_invalid'])
 
     total_ok = 0
     total_err = 0
@@ -857,7 +885,7 @@ def stream_detail(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
+def run_enrichment(limit: int = 100, workers: int = 1, headless: bool = True) -> dict:
     """Main entry point for detail page enrichment.
 
     Fetches pending jobs from the database (those without full_description),
@@ -874,9 +902,10 @@ def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
     conn = init_db()
 
     # URL resolution first
-    url_stats = resolve_all_urls(conn)
-    log.info("URL resolution: %d resolved, %d absolute, %d failed",
-             url_stats["resolved"], url_stats["already_absolute"], url_stats["failed"])
+    url_stats = resolve_all_urls(conn, mark_unresolvable=True)
+    log.info("URL resolution: %d resolved, %d absolute, %d failed, %d marked invalid",
+             url_stats["resolved"], url_stats["already_absolute"],
+             url_stats["failed"], url_stats["marked_invalid"])
 
     # WTTJ special handling
     wttj_count = conn.execute(
@@ -891,6 +920,6 @@ def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
             log.info("WTTJ: %d URLs updated", updated)
 
     # Run the detail scraper
-    stats = _run_detail_scraper(conn, max_per_site=limit, workers=workers)
+    stats = _run_detail_scraper(conn, max_per_site=limit, workers=workers, headless=headless)
 
     return stats

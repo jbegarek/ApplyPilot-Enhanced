@@ -1,13 +1,17 @@
 <!-- logo here -->
 
-# ApplyPilot
+# ApplyPilot Enhanced
+
+Fork of the original [ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot), kept compatible with the existing `applypilot` package, CLI, and `applypilot init` setup flow.
+
+> This fork stays general-purpose. It does not hardcode one job level or one persona. Users still configure their own search targets, filters, resume facts, and preferences through `applypilot init` and their generated config files.
 
 **Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**
 
 [![PyPI version](https://img.shields.io/pypi/v/applypilot?color=blue)](https://pypi.org/project/applypilot/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/Pickle-Pixel/ApplyPilot?style=social)](https://github.com/Pickle-Pixel/ApplyPilot)
+[![GitHub stars](https://img.shields.io/github/stars/jbegarek/ApplyPilot-Enhanced?style=social)](https://github.com/jbegarek/ApplyPilot-Enhanced)
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6S01UL5IO)
 
 
@@ -18,22 +22,46 @@ https://github.com/user-attachments/assets/7ee3417f-43d4-4245-9952-35df1e77f2df
 
 ---
 
+## Fork Notes
+
+This repository is a maintained fork intended to keep upstream compatibility while adding practical fixes and workflow improvements. The Python package name and console command remain `applypilot` for compatibility, but the documentation and metadata identify this repo as `ApplyPilot Enhanced`.
+
+Replace the placeholder fork metadata in `pyproject.toml` with your actual GitHub fork URLs before publishing.
+
+## Changes From Upstream
+
+This fork currently includes:
+
+- Smarter Lensa discovery using Lensa's current search route instead of the stale `/jobs?k=...&l=...` pattern.
+- Lensa API pagination support so discovery can fetch more than the first 20 results per search.
+- Tighter Lensa filtering for remote relevance, salary thresholding, and stronger title matching.
+- Exceptions that keep low-salary part-time, gig, contract, fractional, and executive consulting roles when appropriate.
+- Better per-site smart-extract resilience so one timed-out site does not abort the whole discovery batch.
+- Safer Playwright collection behavior with bounded page-load/idle waits and non-fatal headful fallback.
+- Gemini CLI fixes for Windows and large prompts by sending prompt text over `stdin` instead of command-line args.
+- Updated Gemini tailoring default model from the stale `gemini-1.5-pro` to `gemini-2.5-pro`.
+- Cleaner Gemini error reporting so actionable failures surface instead of noisy repo-scan warnings.
+- Additional tests covering Lensa target generation, pagination, filtering, smart-extract resilience, and Gemini CLI behavior.
+
+---
+
 ## What It Does
 
 ApplyPilot is a 6-stage autonomous job application pipeline. It discovers jobs across 5+ boards, scores them against your resume with AI, tailors your resume per job, writes cover letters, and **submits applications for you**. It navigates forms, uploads documents, answers screening questions, all hands-free.
 
-Three commands. That's it.
+Canonical commands are direct and discoverable.
 
 ```bash
 pip install applypilot
 pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
 applypilot init          # one-time setup: resume, profile, preferences, API keys
 applypilot doctor        # verify your setup — shows what's installed and what's missing
-applypilot run           # discover > enrich > score > tailor > cover letters
-applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
+applypilot pipeline      # full pipeline: discover > enrich > score > tailor > cover > pdf
+applypilot score         # run one stage directly
 applypilot apply         # autonomous browser-driven submission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # fill forms without submitting
+applypilot help          # help without needing --help
 ```
 
 > **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the second command installs jobspy's actual runtime dependencies. Everything except `python-jobspy` installs normally.
@@ -115,7 +143,7 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-Runtime config: `LLM_MODEL` (Claude model override, default: sonnet), `CAPSOLVER_API_KEY` (optional CAPTCHA solving).
+Runtime config: `LLM_PROVIDER`, `LLM_MODEL` (provider-specific model override), `CAPSOLVER_API_KEY` (optional CAPTCHA solving).
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -148,9 +176,11 @@ The Playwright MCP server is configured automatically at runtime per worker. No 
 
 ```bash
 # Utility modes (no Chrome/Claude needed)
-applypilot apply --mark-applied URL    # manually mark a job as applied
-applypilot apply --mark-failed URL     # manually mark a job as failed
-applypilot apply --reset-failed        # reset all failed jobs for retry
+applypilot mark applied --url URL      # manually mark a job as applied
+applypilot mark failed --url URL       # manually mark a job as failed
+applypilot reset failed                # reset all failed jobs for retry
+applypilot remove expired              # delete expired jobs from the database
+applypilot reset in-progress           # clear stale in-progress locks
 applypilot apply --gen --url URL       # generate prompt file for manual debugging
 ```
 
@@ -161,22 +191,68 @@ applypilot apply --gen --url URL       # generate prompt file for manual debuggi
 ```
 applypilot init                         # First-time setup wizard
 applypilot doctor                       # Verify setup, diagnose missing requirements
-applypilot run [stages...]              # Run pipeline stages (or 'all')
-applypilot run --workers 4              # Parallel discovery/enrichment
-applypilot run --stream                 # Concurrent stages (streaming mode)
-applypilot run --min-score 8            # Override score threshold
-applypilot run --dry-run                # Preview without executing
-applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
-applypilot run --validation strict      # Strictest validation (retries on any banned word)
+applypilot help                         # Show canonical help without requiring --help
+applypilot pipeline                     # Run the full pipeline
+applypilot pipeline run discover score  # Run only selected stages
+applypilot discover                     # Run a single stage directly
+applypilot score --llm openai           # Override provider for a single LLM-backed stage
+applypilot tailor --llm gemini --llm-model gemini-2.5-pro
+                                        # Direct stage command with standardized LLM flags
+applypilot pipeline --workers 4         # Parallel discovery/enrichment
+applypilot pipeline --stream            # Concurrent stages (streaming mode)
+applypilot pipeline --min-score 8       # Override score threshold
+applypilot pipeline --dry-run           # Preview without executing
+applypilot pipeline run enrich score tailor --show-browser
+                                        # Non-headless pipeline path into tailor (shows browser during enrich)
+applypilot pipeline --validation lenient
+                                        # Relax validation (recommended for Gemini free tier)
+applypilot pipeline --validation strict # Strictest validation (retries on any banned word)
+applypilot pipeline run enrich --reset-enrich-errors
+                                        # Clear failed enrich attempts, then retry enrichment
+applypilot run score tailor cover --llm openai
+                                        # Legacy compatibility alias; prefer `applypilot pipeline run ...`
+applypilot resume                       # Resume the last saved session (pipeline/apply)
 applypilot apply                        # Launch auto-apply
 applypilot apply --workers 3            # Parallel browser workers
 applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
+applypilot apply --llm claude --llm-model haiku
+                                        # Auto-apply currently supports Claude-only provider/model overrides
+applypilot apply --live-chrome-profile --chrome-profile-directory "Profile 1"
+                                        # Reuse your signed-in Chrome profile
+applypilot apply --live-chrome-profile --live-profile-fallback
+                                        # If live profile fails, fallback to worker clone
+applypilot apply --close-all-chrome     # Prompt, then close running Chrome before apply
 applypilot apply --url URL              # Apply to a specific job
+applypilot export ready-jobs            # Export ready manual-apply work to an .xlsx workbook
+applypilot export ready-jobs --output exports/ready.xlsx
+                                        # Curated ready_to_apply tab + raw_ready_jobs tab
+applypilot mark applied --url URL       # Canonical utility command: mark applied
+applypilot mark failed --url URL --reason "captcha"
+                                        # Canonical utility command: mark failed with reason
+applypilot reset failed                 # Canonical utility command: reset failed jobs
+applypilot remove expired               # Canonical utility command: delete expired jobs from DB
+applypilot reset in-progress            # Canonical utility command: clear stale in-progress locks
+applypilot apply --gen --url URL        # Utility mode: generate manual-debug prompt file
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```
+
+`applypilot export ready-jobs` does not require a cover letter. Any job with a tailored resume that is not already applied is eligible for export, and the workbook always includes both a curated `ready_to_apply` sheet and a `raw_ready_jobs` sheet.
+
+---
+
+## Privacy And Publishing
+
+Do not publish or commit any of the following:
+
+- `~/.applypilot/` contents such as `profile.json`, `searches.yaml`, `resume.txt`, `resume.pdf`, `applypilot.db`, tailored resumes, cover letters, and session state
+- `.env` files containing API keys or provider settings
+- browser profile data, Chrome worker state, or machine-specific MCP configs
+- generated prompt files, logs, screenshots, or debug artifacts that may contain personal resume data, job history, or secrets
+
+This repository should only contain code, tests, templates, and scrubbed documentation. Keep all personal search criteria, compensation preferences, authorization answers, and API credentials out of version control.
 
 ---
 

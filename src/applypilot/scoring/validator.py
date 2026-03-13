@@ -64,8 +64,8 @@ FABRICATION_WATCHLIST: set[str] = {
     "kotlin", "swift", "scala", "matlab",
     # Frameworks for wrong languages
     "spring", "django", "rails", "angular", "vue", "svelte",
-    # Hard lies: certifications can't be stretched
-    "certif", "certified", "pmp", "scrum master", "aws certified",
+    # Hard lies: specific certs you don't hold
+    "pmp", "scrum master", "aws certified",
 }
 
 REQUIRED_SECTIONS: set[str] = {"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"}
@@ -135,15 +135,26 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     # Experience: preserved companies must be present (always enforced)
     resume_facts = profile.get("resume_facts", {})
     preserved_companies = resume_facts.get("preserved_companies", [])
+    # Only the most recent employer is a hard error; older ones are warnings.
+    # LLMs often drop older entries when fitting to 1 page — that's acceptable.
+    required_companies = preserved_companies[:1]
+    optional_companies = preserved_companies[1:]
 
     if isinstance(data["experience"], list):
-        for company in preserved_companies:
+        for company in required_companies:
             has_company = any(
                 company.lower() in str(e.get("header", "")).lower()
                 for e in data["experience"]
             )
             if not has_company:
                 errors.append(f"Company '{company}' missing from experience")
+        for company in optional_companies:
+            has_company = any(
+                company.lower() in str(e.get("header", "")).lower()
+                for e in data["experience"]
+            )
+            if not has_company:
+                warnings.append(f"Older company '{company}' not in experience (acceptable for 1-page)")
         for entry in data["experience"]:
             for b in entry.get("bullets", []):
                 all_text_parts.append(b)

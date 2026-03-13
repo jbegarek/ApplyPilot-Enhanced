@@ -11,6 +11,7 @@ import logging
 import os
 import platform
 import re
+import sqlite3
 import signal
 import subprocess
 import sys
@@ -24,7 +25,7 @@ from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
-from applypilot.database import get_connection
+from applypilot.database import close_connection, get_connection
 from applypilot.llm import UsageLimitError, _is_usage_limit_error
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
 from applypilot.apply.chrome import (
@@ -39,6 +40,28 @@ from applypilot.apply.dashboard import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_readonly_db_error(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "readonly" in str(exc).lower()
+
+
+def _run_write_with_retry(operation):
+    """Retry once with a fresh SQLite connection if a cached handle turns readonly."""
+    for attempt in range(2):
+        conn = get_connection()
+        try:
+            return operation(conn)
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            if attempt == 0 and _is_readonly_db_error(exc):
+                logger.warning("SQLite connection became readonly; reopening cached handle and retrying once.")
+                close_connection()
+                continue
+            raise
 
 # Blocked sites loaded from config/sites.yaml
 def _load_blocked():
@@ -105,8 +128,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     Returns:
         Job dict or None if the queue is empty.
     """
-    conn = get_connection()
-    try:
+    def _operation(conn):
         conn.execute("BEGIN IMMEDIATE")
 
         if target_url:
@@ -143,7 +165,11 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   AND fit_score >= ?
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                ORDER BY
+                  COALESCE(apply_attempts, 0) ASC,
+                  CASE WHEN apply_status IS NULL THEN 0 ELSE 1 END ASC,
+                  fit_score DESC,
+                  url
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
@@ -173,43 +199,45 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         conn.commit()
 
         return dict(row)
-    except Exception:
-        conn.rollback()
-        raise
+    return _run_write_with_retry(_operation)
 
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
                 task_id: str | None = None) -> None:
     """Update a job's apply status in the database."""
-    conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
-    if status == "applied":
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ?
-        """, (now, duration_ms, task_id, url))
-    else:
-        attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
-        conn.execute(f"""
-            UPDATE jobs SET apply_status = ?, apply_error = ?,
-                           apply_attempts = {attempts}, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ?
-        """, (status, error or "unknown", duration_ms, task_id, url))
-    conn.commit()
+    def _operation(conn):
+        now = datetime.now(timezone.utc).isoformat()
+        if status == "applied":
+            conn.execute("""
+                UPDATE jobs SET apply_status = 'applied', applied_at = ?,
+                               apply_error = NULL, agent_id = NULL,
+                               apply_duration_ms = ?, apply_task_id = ?
+                WHERE url = ?
+            """, (now, duration_ms, task_id, url))
+        else:
+            attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
+            conn.execute(f"""
+                UPDATE jobs SET apply_status = ?, apply_error = ?,
+                               apply_attempts = {attempts}, agent_id = NULL,
+                               apply_duration_ms = ?, apply_task_id = ?
+                WHERE url = ?
+            """, (status, error or "unknown", duration_ms, task_id, url))
+        conn.commit()
+
+    _run_write_with_retry(_operation)
 
 
 def release_lock(url: str) -> None:
     """Release the in_progress lock without changing status."""
-    conn = get_connection()
-    conn.execute(
-        "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
-        (url,),
-    )
-    conn.commit()
+    def _operation(conn):
+        conn.execute(
+            "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
+            (url,),
+        )
+        conn.commit()
+
+    _run_write_with_retry(_operation)
 
 
 # ---------------------------------------------------------------------------
@@ -261,21 +289,23 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
         status: Either 'applied' or 'failed'.
         reason: Failure reason (only for status='failed').
     """
-    conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
-    if status == "applied":
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL
-            WHERE url = ?
-        """, (now, url))
-    else:
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'failed', apply_error = ?,
-                           apply_attempts = 99, agent_id = NULL
-            WHERE url = ?
-        """, (reason or "manual", url))
-    conn.commit()
+    def _operation(conn):
+        now = datetime.now(timezone.utc).isoformat()
+        if status == "applied":
+            conn.execute("""
+                UPDATE jobs SET apply_status = 'applied', applied_at = ?,
+                               apply_error = NULL, agent_id = NULL
+                WHERE url = ?
+            """, (now, url))
+        else:
+            conn.execute("""
+                UPDATE jobs SET apply_status = 'failed', apply_error = ?,
+                               apply_attempts = 99, agent_id = NULL
+                WHERE url = ?
+            """, (reason or "manual", url))
+        conn.commit()
+
+    _run_write_with_retry(_operation)
 
 
 def reset_failed() -> int:
@@ -284,16 +314,62 @@ def reset_failed() -> int:
     Returns:
         Number of jobs reset.
     """
-    conn = get_connection()
-    cursor = conn.execute("""
-        UPDATE jobs SET apply_status = NULL, apply_error = NULL,
-                       apply_attempts = 0, agent_id = NULL
-        WHERE apply_status = 'failed'
-          OR (apply_status IS NOT NULL AND apply_status != 'applied'
-              AND apply_status != 'in_progress')
-    """)
-    conn.commit()
-    return cursor.rowcount
+    def _operation(conn):
+        cursor = conn.execute("""
+            UPDATE jobs SET apply_status = NULL, apply_error = NULL,
+                           apply_attempts = 0, agent_id = NULL
+            WHERE apply_status = 'failed'
+              OR (apply_status IS NOT NULL AND apply_status != 'applied'
+                  AND apply_status != 'in_progress')
+        """)
+        conn.commit()
+        return cursor.rowcount
+
+    return _run_write_with_retry(_operation)
+
+
+def remove_expired() -> int:
+    """Remove expired jobs from the database.
+
+    Expired jobs are identified by either:
+    - apply_status = 'expired'
+    - apply_error beginning with 'expired'
+
+    Returns:
+        Number of jobs removed.
+    """
+    def _operation(conn):
+        cursor = conn.execute(
+            """
+            DELETE FROM jobs
+            WHERE LOWER(COALESCE(apply_status, '')) = 'expired'
+               OR LOWER(COALESCE(apply_error, '')) LIKE 'expired%'
+            """
+        )
+        conn.commit()
+        return cursor.rowcount
+
+    return _run_write_with_retry(_operation)
+
+
+def reset_in_progress() -> int:
+    """Clear stale in-progress apply locks.
+
+    Returns:
+        Number of rows unlocked.
+    """
+    def _operation(conn):
+        cursor = conn.execute(
+            """
+            UPDATE jobs
+            SET apply_status = NULL, agent_id = NULL
+            WHERE apply_status = 'in_progress'
+            """
+        )
+        conn.commit()
+        return cursor.rowcount
+
+    return _run_write_with_retry(_operation)
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +640,10 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "sonnet", dry_run: bool = False,
+                use_real_profile: bool = False,
+                chrome_profile_directory: str | None = None,
+                allow_real_profile_fallback: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -575,6 +654,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         headless: Run Chrome headless.
         model: Claude model name.
         dry_run: Don't click Submit.
+        use_real_profile: Launch Chrome against the user's real profile dir.
+        chrome_profile_directory: Chrome profile dir name (e.g., "Default", "Profile 1").
+        allow_real_profile_fallback: If live profile launch fails, retry with worker clone.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -618,7 +700,14 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         leave_chrome_open = False
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(slot_id, port=port, headless=headless)
+            chrome_proc = launch_chrome(
+                slot_id,
+                port=port,
+                headless=headless,
+                use_real_profile=use_real_profile,
+                profile_directory=chrome_profile_directory,
+                allow_real_profile_fallback=allow_real_profile_fallback,
+            )
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run)
@@ -821,7 +910,10 @@ def _handle_captcha_intervention(console: Console, model: str = "sonnet",
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1) -> None:
+         poll_interval: int = 60, workers: int = 1,
+         use_real_profile: bool = False,
+         chrome_profile_directory: str | None = None,
+         allow_real_profile_fallback: bool = False) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -834,6 +926,9 @@ def main(limit: int = 1, target_url: str | None = None,
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
+        use_real_profile: Launch Chrome against the user's real profile dir.
+        chrome_profile_directory: Chrome profile dir name (e.g., "Default", "Profile 1").
+        allow_real_profile_fallback: If live profile launch fails, retry with worker clone.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -905,6 +1000,9 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     model=model,
                     dry_run=dry_run,
+                    use_real_profile=use_real_profile,
+                    chrome_profile_directory=chrome_profile_directory,
+                    allow_real_profile_fallback=allow_real_profile_fallback,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -928,6 +1026,9 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run,
+                            use_real_profile=use_real_profile,
+                            chrome_profile_directory=chrome_profile_directory,
+                            allow_real_profile_fallback=allow_real_profile_fallback,
                         ): i
                         for i in range(workers)
                     }

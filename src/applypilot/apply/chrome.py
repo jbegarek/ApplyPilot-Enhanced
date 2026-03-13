@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from applypilot import config
@@ -23,6 +25,38 @@ BASE_CDP_PORT = 9222
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_lock = threading.Lock()
+
+
+def _normalize_profile_directory(profile_directory: str | None) -> str:
+    """Validate and normalize a Chrome profile directory name."""
+    profile = (profile_directory or "").strip()
+    if not profile:
+        return "Default"
+    if "/" in profile or "\\" in profile or profile in {".", ".."}:
+        raise ValueError(
+            "Invalid chrome profile directory. Use a profile folder name like 'Default' or 'Profile 1'."
+        )
+    return profile
+
+
+def _is_cdp_ready(port: int, timeout: float = 1.5) -> bool:
+    """Return True if Chrome DevTools endpoint is reachable on the given port."""
+    url = f"http://127.0.0.1:{port}/json/version"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return False
+
+
+def _wait_for_cdp(port: int, max_wait_sec: float = 12.0) -> bool:
+    """Poll briefly for the Chrome DevTools endpoint to become available."""
+    deadline = time.time() + max_wait_sec
+    while time.time() < deadline:
+        if _is_cdp_ready(port):
+            return True
+        time.sleep(0.25)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -93,11 +127,82 @@ def _kill_on_port(port: int) -> None:
         logger.debug("Failed to kill process on port %d", port, exc_info=True)
 
 
+def _count_system_chrome_processes() -> int:
+    """Best-effort count of currently running Chrome/Chromium processes."""
+    try:
+        system = platform.system()
+        if system == "Windows":
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq chrome.exe"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            lines = [line for line in result.stdout.splitlines() if line.lower().startswith("chrome.exe")]
+            return len(lines)
+
+        # macOS / Linux
+        result = subprocess.run(
+            ["pgrep", "-f", "chrome|chromium|Google Chrome"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return 0
+        return len([line for line in result.stdout.splitlines() if line.strip()])
+    except FileNotFoundError:
+        return 0
+    except Exception:
+        logger.debug("Failed to count system Chrome processes", exc_info=True)
+        return 0
+
+
+def kill_system_chrome_processes() -> tuple[int, int]:
+    """Best-effort kill for all local Chrome/Chromium processes.
+
+    This is intentionally broad and meant for user-approved cleanup before
+    launching CDP in live-profile mode.
+
+    Returns:
+        Tuple of (before_count, after_count) process estimates.
+    """
+    before_count = _count_system_chrome_processes()
+    try:
+        system = platform.system()
+        if system == "Windows":
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "chrome.exe"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+            )
+            time.sleep(1.0)
+            return before_count, _count_system_chrome_processes()
+
+        # macOS / Linux: attempt common Chrome process names.
+        for pattern in ("Google Chrome", "Chromium", "chrome", "chromium"):
+            subprocess.run(
+                ["pkill", "-f", pattern],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        time.sleep(1.0)
+        return before_count, _count_system_chrome_processes()
+    except FileNotFoundError:
+        logger.debug("taskkill/pkill not found while attempting Chrome cleanup")
+        return before_count, _count_system_chrome_processes()
+    except Exception:
+        logger.debug("Failed to kill system Chrome processes", exc_info=True)
+        return before_count, _count_system_chrome_processes()
+
+
 # ---------------------------------------------------------------------------
 # Worker profile management
 # ---------------------------------------------------------------------------
 
-def setup_worker_profile(worker_id: int) -> Path:
+def setup_worker_profile(worker_id: int, profile_directory: str = "Default") -> Path:
     """Create an isolated Chrome profile for a worker.
 
     On first run, clones from an existing worker profile (preferred, since
@@ -110,8 +215,9 @@ def setup_worker_profile(worker_id: int) -> Path:
     Returns:
         Path to the worker's Chrome user-data directory.
     """
+    selected_profile = _normalize_profile_directory(profile_directory)
     profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
-    if (profile_dir / "Default").exists():
+    if (profile_dir / selected_profile).exists():
         return profile_dir  # Already initialized
 
     # Find a source: prefer existing worker (has session cookies), else user profile
@@ -120,14 +226,18 @@ def setup_worker_profile(worker_id: int) -> Path:
         if wid == worker_id:
             continue
         candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
+        if (candidate / selected_profile).exists():
             source = candidate
             break
     if source is None:
         source = config.get_chrome_user_data()
 
-    logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
-                worker_id, source.name)
+    logger.info(
+        "[worker-%d] Copying Chrome profile from %s (profile-dir=%s)...",
+        worker_id,
+        source.name,
+        selected_profile,
+    )
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy essential profile dirs -- skip caches and heavy transient data
@@ -159,13 +269,13 @@ def setup_worker_profile(worker_id: int) -> Path:
     return profile_dir
 
 
-def _suppress_restore_nag(profile_dir: Path) -> None:
+def _suppress_restore_nag(profile_dir: Path, profile_directory: str = "Default") -> None:
     """Clear Chrome's 'restore pages' nag by fixing Preferences.
 
     Chrome writes exit_type=Crashed when killed, which triggers a
     'Restore pages?' prompt on next launch. This patches it out.
     """
-    prefs_file = profile_dir / "Default" / "Preferences"
+    prefs_file = profile_dir / _normalize_profile_directory(profile_directory) / "Preferences"
     if not prefs_file.exists():
         return
 
@@ -186,14 +296,61 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # Chrome launch / kill
 # ---------------------------------------------------------------------------
 
-def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False) -> subprocess.Popen:
+def open_worker_profile_browser(
+    worker_id: int = 0,
+    profile_directory: str | None = None,
+) -> subprocess.Popen:
+    """Open a regular Chrome window using an existing worker profile clone.
+
+    This is used after auto-apply so users can continue from the same
+    authenticated worker profile without manually typing Chrome flags.
+    """
+    chrome_exe = config.get_chrome_path()
+    selected_profile = _normalize_profile_directory(
+        profile_directory or config.get_chrome_profile_directory()
+    )
+    worker_profile_dir = setup_worker_profile(worker_id, profile_directory=selected_profile)
+    _suppress_restore_nag(worker_profile_dir, profile_directory=selected_profile)
+
+    cmd = [
+        chrome_exe,
+        f"--user-data-dir={worker_profile_dir}",
+        f"--profile-directory={selected_profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if platform.system() == "Windows":
+        # Keep helper launch detached from the CLI process lifecycle.
+        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+
+    proc = subprocess.Popen(cmd, **kwargs)
+    logger.info(
+        "Opened worker profile Chrome window (worker=%d, profile=%s, pid=%d)",
+        worker_id,
+        selected_profile,
+        proc.pid,
+    )
+    return proc
+
+
+def launch_chrome(
+    worker_id: int,
+    port: int | None = None,
+    headless: bool = False,
+    use_real_profile: bool = False,
+    profile_directory: str | None = None,
+    allow_real_profile_fallback: bool = False,
+) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
 
     Args:
         worker_id: Numeric worker identifier.
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
         headless: Run Chrome in headless mode (no visible window).
+        use_real_profile: Use the real Chrome user-data dir instead of a worker clone.
+        profile_directory: Chrome profile dir name (e.g., "Default", "Profile 1").
+        allow_real_profile_fallback: If live profile launch fails, retry with worker clone.
 
     Returns:
         subprocess.Popen handle for the Chrome process.
@@ -201,39 +358,10 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if port is None:
         port = BASE_CDP_PORT + worker_id
 
-    profile_dir = setup_worker_profile(worker_id)
-
-    # Kill any zombie Chrome from a previous run on this port
-    _kill_on_port(port)
-
-    # Patch preferences to suppress restore nag
-    _suppress_restore_nag(profile_dir)
-
     chrome_exe = config.get_chrome_path()
-
-    cmd = [
-        chrome_exe,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile_dir}",
-        "--profile-directory=Default",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--window-size=1024,768",
-        "--disable-session-crashed-bubble",
-        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
-        "--hide-crash-restore-bubble",
-        "--noerrdialogs",
-        "--password-store=basic",
-        "--disable-save-password-bubble",
-        "--disable-popup-blocking",
-        # Block dangerous permissions at browser level
-        "--use-fake-device-for-media-stream",
-        "--use-fake-ui-for-media-stream",
-        "--deny-permission-prompts",
-        "--disable-notifications",
-    ]
-    if headless:
-        cmd.append("--headless=new")
+    selected_profile = _normalize_profile_directory(
+        profile_directory or config.get_chrome_profile_directory()
+    )
 
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -241,15 +369,124 @@ def launch_chrome(worker_id: int, port: int | None = None,
         import os
         kwargs["preexec_fn"] = os.setsid
 
-    proc = subprocess.Popen(cmd, **kwargs)
-    with _chrome_lock:
-        _chrome_procs[worker_id] = proc
+    last_exit_code: int | None = None
 
-    # Give Chrome time to start and open the debug port
-    time.sleep(3)
-    logger.info("[worker-%d] Chrome started on port %d (pid %d)",
-                worker_id, port, proc.pid)
-    return proc
+    def _start_with_profile(profile_dir: Path) -> subprocess.Popen | None:
+        nonlocal last_exit_code
+        profile_path = profile_dir / selected_profile
+        if not profile_path.exists():
+            logger.warning(
+                "[worker-%d] Chrome profile directory '%s' does not exist under %s.",
+                worker_id,
+                selected_profile,
+                profile_dir,
+            )
+            return None
+
+        # Kill any zombie Chrome from a previous run on this port
+        _kill_on_port(port)
+
+        cmd = [
+            chrome_exe,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile_dir}",
+            f"--profile-directory={selected_profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--window-size=1024,768",
+            "--disable-session-crashed-bubble",
+            "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
+            "--hide-crash-restore-bubble",
+            "--noerrdialogs",
+            "--password-store=basic",
+            "--disable-save-password-bubble",
+            "--disable-popup-blocking",
+            # Block dangerous permissions at browser level
+            "--use-fake-device-for-media-stream",
+            "--deny-permission-prompts",
+            "--disable-notifications",
+        ]
+        if headless:
+            cmd.append("--headless=new")
+
+        proc = subprocess.Popen(cmd, **kwargs)
+        with _chrome_lock:
+            _chrome_procs[worker_id] = proc
+
+        if _wait_for_cdp(port):
+            logger.info(
+                "[worker-%d] Chrome started on port %d (pid %d, profile=%s)",
+                worker_id,
+                port,
+                proc.pid,
+                f"{profile_dir}::{selected_profile}",
+            )
+            return proc
+
+        logger.warning(
+            "[worker-%d] Chrome launched but CDP endpoint not reachable on port %d (profile=%s).",
+            worker_id,
+            port,
+            f"{profile_dir}::{selected_profile}",
+        )
+        if proc.poll() is None:
+            _kill_process_tree(proc.pid)
+        else:
+            last_exit_code = proc.returncode
+        with _chrome_lock:
+            _chrome_procs.pop(worker_id, None)
+        return None
+
+    if use_real_profile:
+        real_profile = config.get_chrome_user_data()
+        if real_profile.exists():
+            proc = _start_with_profile(real_profile)
+            if proc is not None:
+                return proc
+            if not allow_real_profile_fallback:
+                extra = ""
+                if last_exit_code == 21:
+                    extra = (
+                        " Chrome exited with code 21 (profile lock/permission). "
+                        "Try --close-all-chrome, or use --live-profile-fallback."
+                    )
+                raise RuntimeError(
+                    f"Chrome CDP unavailable on port {port} for live profile '{selected_profile}'. "
+                    f"Close all regular Chrome windows, then retry.{extra}"
+                )
+            logger.warning(
+                "[worker-%d] Falling back to worker profile clone after live profile launch failed "
+                "(profile-dir=%s).",
+                worker_id,
+                selected_profile,
+            )
+        else:
+            if not allow_real_profile_fallback:
+                raise RuntimeError(
+                    f"Chrome user data directory not found at {real_profile}. "
+                    "Set CHROME_PATH/CHROME_PROFILE_DIRECTORY or disable --live-chrome-profile."
+                )
+            logger.warning(
+                "[worker-%d] Real Chrome user data dir not found at %s; "
+                "falling back to worker profile clone.",
+                worker_id,
+                real_profile,
+            )
+
+    profile_dir = setup_worker_profile(worker_id, profile_directory=selected_profile)
+    _suppress_restore_nag(profile_dir, profile_directory=selected_profile)
+    proc = _start_with_profile(profile_dir)
+    if proc is not None:
+        return proc
+
+    if use_real_profile:
+        extra = ""
+        if last_exit_code == 21:
+            extra = " Chrome exit code 21 indicates profile lock/permission."
+        raise RuntimeError(
+            f"Chrome CDP unavailable on port {port} for profile '{selected_profile}'.{extra}"
+        )
+    raise RuntimeError(f"Chrome CDP unavailable on port {port}.")
 
 
 def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
