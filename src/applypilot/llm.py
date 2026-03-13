@@ -179,7 +179,8 @@ def resolve_llm_config(env: Mapping[str, str] | None = None, *, tier: str = "gen
     env_map = env if env is not None else os.environ
     local_url = _env_get(env_map, "LLM_URL")
     explicit_provider = _legacy_provider(env_map)
-    model = _env_get(env_map, "LLM_MODEL")
+    tier_model = _env_get(env_map, f"LLM_MODEL_{tier.upper()}")
+    model = tier_model or _env_get(env_map, "LLM_MODEL")
 
     if model:
         if "/" in model:

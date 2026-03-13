@@ -160,3 +160,76 @@ def test_generate_dashboard_handles_missing_optional_fields(tmp_path, monkeypatc
     assert "Basic Job" in html
     assert "No submitted applications yet." in html
     assert "No failed applications." in html
+
+
+def test_generate_dashboard_excludes_in_progress_from_failed_table(tmp_path, monkeypatch) -> None:
+    conn = _make_conn(tmp_path)
+    conn.executemany(
+        """
+        INSERT INTO jobs (
+            url, title, salary, description, location, site, strategy, discovered_at,
+            full_description, application_url, detail_scraped_at, detail_error,
+            fit_score, score_reasoning, applied_at, apply_status, apply_error,
+            apply_attempts, last_attempted_at, apply_duration_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                "https://example.com/in-progress",
+                "In Progress Job",
+                None,
+                "",
+                "Remote",
+                "ExampleSite",
+                "manual",
+                "2026-03-13T12:00:00+00:00",
+                "In progress full description",
+                "https://example.com/apply/in-progress",
+                "2026-03-13T12:00:00+00:00",
+                None,
+                8,
+                "python\nIn progress",
+                None,
+                "in_progress",
+                None,
+                1,
+                "2026-03-13T12:15:00+00:00",
+                None,
+            ),
+            (
+                "https://example.com/failed-real",
+                "Actually Failed Job",
+                None,
+                "",
+                "Remote",
+                "ExampleSite",
+                "manual",
+                "2026-03-13T11:00:00+00:00",
+                "Failed full description",
+                "https://example.com/apply/failed-real",
+                "2026-03-13T11:00:00+00:00",
+                None,
+                7,
+                "python\nFailed",
+                None,
+                "captcha",
+                "Captcha blocked submission",
+                2,
+                "2026-03-13T11:30:00+00:00",
+                None,
+            ),
+        ],
+    )
+    conn.commit()
+
+    monkeypatch.setattr(view, "get_connection", lambda: conn)
+    output = tmp_path / "dashboard.html"
+
+    view.generate_dashboard(str(output))
+    html = output.read_text(encoding="utf-8")
+
+    failed_section = html.split("Failed Applications", 1)[1].split('<div id="job-count"', 1)[0]
+
+    assert "Actually Failed Job" in failed_section
+    assert "In Progress Job" not in failed_section
+    assert '<span class="count-badge">1</span>' in failed_section

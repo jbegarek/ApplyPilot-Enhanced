@@ -93,7 +93,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
                apply_status, apply_error, apply_attempts, last_attempted_at,
                application_url
         FROM jobs
-        WHERE apply_status IS NOT NULL AND apply_status != 'applied'
+        WHERE apply_status IS NOT NULL AND apply_status NOT IN ('applied', 'in_progress')
           AND apply_attempts > 0
         ORDER BY last_attempted_at DESC
     """).fetchall()

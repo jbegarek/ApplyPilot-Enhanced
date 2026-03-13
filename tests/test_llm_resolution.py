@@ -54,6 +54,19 @@ def test_llm_url_infers_local_default_model_and_allows_missing_api_key() -> None
     assert cfg.api_key == ""
 
 
+def test_tier_specific_model_override_works_without_explicit_provider() -> None:
+    cfg = resolve_llm_config(
+        {
+            "OPENAI_API_KEY": "o-key",
+            "LLM_MODEL_TAILOR": "openai/gpt-4.1",
+        },
+        tier="tailor",
+    )
+    assert cfg.provider == "openai"
+    assert cfg.model == "openai/gpt-4.1"
+    assert cfg.api_key == "o-key"
+
+
 def test_missing_everything_raises_clear_error() -> None:
     with pytest.raises(RuntimeError, match="No LLM provider configured"):
         resolve_llm_config({})
